@@ -2,8 +2,10 @@
 //! reattach. Each test is skipped where its program is not installed.
 //!
 //! What can be checked without eyes: the program is told to repaint and
-//! does, the terminal is put into the modes the program uses and taken out
-//! of them again, and nothing in the replay asks the terminal a question.
+//! does, and the terminal is put into the modes the program uses and taken
+//! out of them again. (That replayed history asks the terminal nothing is
+//! checked in `reliability.rs`, where history and live output can be told
+//! apart; a repainting program may well ask its terminal something anew.)
 
 mod common;
 
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use common::{contains, Home, RATCH};
 use ratch::sys::{self, PollFd, PollFlags, Winsize};
-use ratch::vt::{filter::is_query, Modes, Parser};
+use ratch::vt::{Modes, Parser};
 
 const DETACH: &[u8] = b"\x1c";
 
@@ -100,12 +102,6 @@ fn modes_after(bytes: &[u8]) -> Modes {
     modes
 }
 
-fn queries_in(bytes: &[u8]) -> usize {
-    let mut count = 0;
-    Parser::new().feed(bytes, |token| count += usize::from(is_query(&token)));
-    count
-}
-
 /// Start `program` in a session, detach, attach from a second terminal,
 /// detach again; check each terminal at each step.
 fn round_trip(tag: &str, program: &[&str], quit: &[u8]) {
@@ -151,11 +147,6 @@ fn round_trip(tag: &str, program: &[&str], quit: &[u8]) {
         modes_after(&second.seen),
         running,
         "{tag}: second terminal is not in the modes the program set up"
-    );
-    assert_eq!(
-        queries_in(&second.seen),
-        0,
-        "{tag}: replay asked the terminal a question"
     );
     // Told the window (may have) changed, a full-screen program repaints:
     // more arrives than the handful of bytes that set the modes.
