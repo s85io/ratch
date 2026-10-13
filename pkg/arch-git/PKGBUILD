@@ -1,0 +1,44 @@
+# Builds the current main branch. For a released version use ../arch/PKGBUILD.
+pkgname=ratch-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Detachable terminal sessions without terminal emulation'
+arch=('x86_64' 'aarch64')
+url='https://github.com/s85io/ratch'
+license=('GPL-2.0-or-later')
+depends=('gcc-libs')
+makedepends=('cargo' 'git')
+checkdepends=('vim' 'less')
+provides=('ratch')
+conflicts=('ratch')
+options=('!debug' '!lto')
+source=("ratch::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd ratch
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd ratch
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd ratch
+  cargo build --frozen --release
+}
+
+check() {
+  cd ratch
+  cargo test --frozen
+  sh tests/test.sh "$PWD/target/release/ratch"
+}
+
+package() {
+  cd ratch
+  make install CARGO=true PREFIX=/usr DESTDIR="$pkgdir"
+}
