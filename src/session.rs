@@ -755,6 +755,13 @@ mod tests {
             "a live socket must be left alone"
         );
         drop(listener);
+        // Another test may be starting a process at this very moment, and
+        // until that process execs it holds a copy of every descriptor in
+        // this one, the listener included. Give it a moment to let go.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(session.probe(), Probe::Stale) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(matches!(session.probe(), Probe::Stale));
         // A master that outlived its socket must not remove its successor's.
         assert!(session.remove_stale_socket());
