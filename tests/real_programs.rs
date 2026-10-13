@@ -218,6 +218,9 @@ fn htop() {
     round_trip("htop", &["htop"], b"q");
 }
 
+// FreeBSD's terminal description for xterm has no alternate screen, so its
+// less is not a full-screen program in the sense tested here.
+#[cfg(not(target_os = "freebsd"))]
 #[test]
 fn less() {
     if !installed("less") {
