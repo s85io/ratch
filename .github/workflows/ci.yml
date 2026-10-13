@@ -28,7 +28,7 @@ jobs:
       - name: Programs for the real-program tests
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y vim htop less
-      - run: cargo test
+      - run: sh scripts/ci-test.sh
       - name: Black-box suite
         run: |
           cargo build --release
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add x86_64-unknown-linux-musl
-      - run: cargo test --target x86_64-unknown-linux-musl
+      - run: sh scripts/ci-test.sh --target x86_64-unknown-linux-musl
       - run: cargo build --release --target x86_64-unknown-linux-musl
       - name: Static, and not too big
         run: |
@@ -58,7 +58,8 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
+          envs: GITHUB_ACTIONS
           run: |
-            cargo test
+            sh scripts/ci-test.sh
             cargo build --release
             sh tests/test.sh "$PWD/target/release/ratch"
