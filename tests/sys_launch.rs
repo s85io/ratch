@@ -11,6 +11,12 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{Pid, Signal};
 use rustix::termios::{LocalModes, Winsize};
 
+/// Run `argv` on `slave`, keeping the caller's handle on it. Without one,
+/// some systems discard what a short-lived program wrote before it is read.
+fn spawn(slave: &OwnedFd, argv: &[OsString]) -> std::process::Child {
+    sys::spawn_on_pty(slave.try_clone().unwrap(), argv, &[]).unwrap()
+}
+
 fn sh(script: &str) -> Vec<OsString> {
     ["/bin/sh", "-c", script]
         .iter()
@@ -60,12 +66,10 @@ fn read_until(master: &OwnedFd, done: impl Fn(&str) -> bool) -> (String, &'stati
 #[test]
 fn child_gets_a_controlling_terminal() {
     let (master, slave) = sys::open_pty(None, None).unwrap();
-    let mut child = sys::spawn_on_pty(
-        slave,
+    let mut child = spawn(
+        &slave,
         &sh("if ( : </dev/tty ) 2>/dev/null; then echo CTTY_OK; else echo CTTY_MISSING; fi"),
-        &[],
-    )
-    .unwrap();
+    );
     let (out, how) = read_until(&master, |s| s.contains("CTTY_OK"));
     assert_eq!(how, "matched", "output: {out:?}");
     assert!(child.wait().unwrap().success());
@@ -79,7 +83,7 @@ fn termios_and_size_reach_the_child() {
     drop((probe, probe_slave));
 
     let (master, slave) = sys::open_pty(Some(&termios), Some(winsize(33, 77))).unwrap();
-    let mut child = sys::spawn_on_pty(slave, &sh("stty size; stty -a; echo END"), &[]).unwrap();
+    let mut child = spawn(&slave, &sh("stty size; stty -a; echo END"));
     let (out, how) = read_until(&master, |s| s.contains("END"));
     assert_eq!(how, "matched", "output: {out:?}");
     assert!(out.contains("33 77"), "size not applied: {out:?}");
@@ -91,7 +95,7 @@ fn termios_and_size_reach_the_child() {
 fn resize_and_winch_reach_the_foreground() {
     let (master, slave) = sys::open_pty(None, Some(winsize(24, 80))).unwrap();
     let script = "trap 'stty size; exit 0' WINCH; echo READY; while :; do sleep 0.05; done";
-    let mut child = sys::spawn_on_pty(slave, &sh(script), &[]).unwrap();
+    let mut child = spawn(&slave, &sh(script));
     let (_, how) = read_until(&master, |s| s.contains("READY"));
     assert_eq!(how, "matched");
 
@@ -106,7 +110,7 @@ fn resize_and_winch_reach_the_foreground() {
 #[test]
 fn signal_foreground_terminates_the_program() {
     let (master, slave) = sys::open_pty(None, None).unwrap();
-    let mut child = sys::spawn_on_pty(slave, &sh("echo READY; sleep 1000"), &[]).unwrap();
+    let mut child = spawn(&slave, &sh("echo READY; sleep 1000"));
     let (_, how) = read_until(&master, |s| s.contains("READY"));
     assert_eq!(how, "matched");
     sys::signal_foreground(master.as_fd(), Pid::from_child(&child), Signal::TERM).unwrap();
@@ -116,13 +120,14 @@ fn signal_foreground_terminates_the_program() {
 #[test]
 fn child_starts_with_default_sigpipe() {
     let (master, slave) = sys::open_pty(None, None).unwrap();
-    let mut child = sys::spawn_on_pty(slave, &sh("kill -PIPE $$; echo SURVIVED"), &[]).unwrap();
-    let (out, _) = read_until(&master, |s| s.contains("SURVIVED"));
+    let mut child = spawn(&slave, &sh("kill -PIPE $$; echo SURVIVED"));
+    assert_eq!(child.wait().unwrap().signal(), Some(Signal::PIPE.as_raw()));
+    drop(slave);
+    let (out, _) = read_until(&master, |_| false);
     assert!(
         !out.contains("SURVIVED"),
         "SIGPIPE was ignored in the child"
     );
-    assert_eq!(child.wait().unwrap().signal(), Some(Signal::PIPE.as_raw()));
 }
 
 #[test]
@@ -136,13 +141,15 @@ fn exec_failure_is_reported_to_the_caller() {
 #[test]
 fn pty_reports_the_end_after_final_output() {
     let (master, slave) = sys::open_pty(None, None).unwrap();
-    let mut child = sys::spawn_on_pty(slave, &sh("echo LAST"), &[]).unwrap();
-    // Read first, wait second. On macOS a process cannot finish exiting while
-    // its pty output is unread, so waiting first would deadlock; the master
-    // must keep draining the pty for as long as it waits for the program.
-    let (out, how) = read_until(&master, |_| false);
-    assert!(out.contains("LAST"), "final output lost: {out:?}");
-    assert!(how == "eof" || how == "error", "pty never closed: {how}");
-    eprintln!("pty end of stream is reported as: {how}");
+    let mut child = spawn(&slave, &sh("echo LAST"));
+    // Two systems, two rules, and a reader has to follow both. On macOS a
+    // program cannot finish exiting while its output is unread: read before
+    // waiting. On FreeBSD output still unread when the last handle on the
+    // program's side closes may be discarded: keep one until it is read.
+    let (out, how) = read_until(&master, |s| s.contains("LAST"));
+    assert_eq!(how, "matched", "final output lost: {out:?}");
     assert!(child.wait().unwrap().success());
+    drop(slave);
+    let (_, how) = read_until(&master, |_| false);
+    assert!(how == "eof" || how == "error", "pty never closed: {how}");
 }

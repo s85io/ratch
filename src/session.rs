@@ -332,6 +332,9 @@ impl Session {
         let listener =
             sys::with_private_umask(|| self.with_socket_path(|path| UnixListener::bind(path)))?;
         listener.set_nonblocking(true)?;
+        // The mask made it private from the start; this makes sure of it
+        // whatever the mask turned out to be.
+        self.set_attached(false);
         let id = self
             .sock_id()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
