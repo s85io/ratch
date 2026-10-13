@@ -431,8 +431,12 @@ pub fn close_inherited_fds() {
     for fd in fds.into_iter().filter(|&fd| fd > 2) {
         // SAFETY: the caller has opened nothing yet, so no value in this
         // process owns any of these descriptors. Some are not open at all
-        // (the sweep, or the handle just used for listing); this close
-        // ignores that, where dropping an `OwnedFd` would abort.
-        unsafe { rustix::io::close(fd) };
+        // (the sweep, or the handle just used for listing), and closing one
+        // of those is treated as a bug by the libraries, so ask first.
+        unsafe {
+            if rustix::io::fcntl_getfd(BorrowedFd::borrow_raw(fd)).is_ok() {
+                rustix::io::close(fd);
+            }
+        }
     }
 }

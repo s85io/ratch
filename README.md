@@ -1,8 +1,7 @@
 <h1 align="center">ratch</h1>
 
 <p align="center">
-  <b>Leave a terminal program running. Come back to it later, from anywhere.</b><br>
-  Nothing between you and the program: no terminal emulation, no windows, no configuration.
+  <b>Leave a terminal program running. Come back to it later, from anywhere.</b>
 </p>
 
 <p align="center">
@@ -11,256 +10,204 @@
   <img src="https://img.shields.io/badge/binary-one%20static%20file-success" alt="one static binary">
 </p>
 
+<p align="center"><b>English</b> · <a href="README.ru.md">Русский</a></p>
+
 ```console
-$ ratch work                 # attach to "work"; it does not exist yet, so it is created
-ratch: session 'work' created
-$ make -j8                   # ... start something long, then press Ctrl-\
+$ ratch work                 # attach to "work"; created if it does not exist
+$ make -j8                   # start something long, then press Ctrl-\
 [ratch: session 'work' detached after 12s]
 
 $ ratch list
 work                     since 3m 2s ago  pid 4242  /bin/zsh
 
-$ ratch work                 # tomorrow, from another machine over SSH
-... the build output, and your shell, right where you left them
+$ ratch work                 # later, from another machine: right where you left it
 ```
 
-## Inspired by atch
+## ✨ What it does
 
-`ratch` exists because of [atch](https://github.com/mobydeck/atch), and atch
-because of [dtach](https://github.com/crigler/dtach) by Ned T. Crigler.
+- 🔌 **Detach and reattach** — the program keeps running without a terminal.
+- 🪟 **No terminal emulation** — bytes pass through unchanged, so mouse, true colour, images and `$TERM` work as they do without it.
+- 📜 **History** — recent output is replayed on attach; all of it is in a log.
+- 🖥️ **Terminal state** — attaching switches on the modes the program uses (alternate screen, mouse, bracketed paste, keyboard protocol); detaching switches them off.
+- 🚦 **Nothing waits** — a hung or slow terminal never stalls the program or other terminals.
+- 📦 **One static binary**, no configuration file.
 
-dtach had one idea and stopped there: detaching is a small problem, and it
-does not take a terminal emulator to solve it. Put the program on a
-pseudo-terminal, keep that alive, and pass bytes back and forth. Twenty
-years on, that is still why mouse, true colour, images and every new
-terminal protocol work through it without anyone having taught it about them.
+It is not a multiplexer: no windows, panes or status line. For those, use tmux.
 
-atch took that idea and made it pleasant to live with. Sessions got names
-instead of socket paths. `atch work` attached or created, whichever was
-needed. Output went to a log, so a session had a past: you could see what
-happened before you attached, and even after the program was gone. All of it
-in one small static binary with nothing to configure. That is the tool I
-wanted to keep using.
+## 🧭 How it works
 
-Using it daily showed where it gave way. A terminal that stopped reading —
-a dropped SSH connection, a paused screen — stopped the program in the
-session too. Attaching from a second terminal to a full-screen program left
-mouse and alternate screen switched off; detaching left them switched on in
-your shell. Replaying the log made the terminal answer questions the program
-had asked hours ago, and the answers landed in the session as typed garbage.
+```mermaid
+flowchart LR
+    T1["🖥️ terminal"] <--> C1["ratch<br/>client"]
+    T2["🖥️ terminal"] <--> C2["ratch<br/>client"]
+    C1 <-->|unix socket| M
+    C2 <-->|unix socket| M
+    subgraph M["ratch master — one per session"]
+        direction TB
+        R["ring buffer<br/>last 1 MB of output"]
+        S["mode tracker<br/>what the program switched on"]
+    end
+    M <-->|pty| P["⚙️ your program"]
+    M --> L[("📄 session.log")]
+```
 
-Fixing those meant replacing the core, so `ratch` is that: the same idea and
-the same feel, rewritten in Rust around a different centre.
+Each session has a **master** process that owns the program's pseudo-terminal.
+Output goes into a ring buffer; every attached client is a cursor into it and
+reads at its own pace. A client that falls more than the buffer behind skips
+ahead instead of holding anyone up. The master also remembers which terminal
+modes the program switched on, so a terminal that attaches later can be put
+into them.
+
+## 💡 Inspired by atch
+
+`ratch` is a rewrite in Rust of [atch](https://github.com/mobydeck/atch),
+which builds on [dtach](https://github.com/crigler/dtach) by Ned T. Crigler.
+
+dtach showed that detaching does not need a terminal emulator. atch made that
+pleasant: named sessions, `atch work` to attach or create, a log that gives a
+session a past, one small binary. `ratch` keeps all of that and replaces the
+core, to fix what gave way in daily use:
 
 | | atch | ratch |
 |---|---|---|
-| A terminal that stops reading | stops the program | falls behind on its own; the program runs on |
-| Attaching to a full-screen program | modes are lost | terminal is put into the program's modes |
-| Detaching from one | modes stay on in your shell | switched off again |
-| History on attach | the whole log, replayed by the client | the recent part, served by the session, with terminal queries taken out |
-| Two people creating the same session at once | not guarded against | one wins, the other is told |
-| How a session ended | not recorded | `ratch wait` returns its exit status |
+| 🚦 A terminal that stops reading | stops the program | falls behind on its own |
+| 🖥️ Attaching to a full-screen program | modes are lost | terminal is put into the program's modes |
+| ↩️ Detaching from one | modes stay on in your shell | switched off again |
+| 📜 History on attach | the whole log, replayed by the client | the recent part, with terminal queries taken out |
+| 🏁 Two creators of one session at once | not guarded against | one wins, the other is told |
+| 🔢 How a session ended | not recorded | `ratch wait` returns its exit status |
 
-What it deliberately keeps: one static binary, no configuration file, no
-terminal emulation, and `ratch <name>` doing the obvious thing.
+It is not a drop-in replacement: the two cannot attach to each other's
+sessions, and the dtach-style flags are gone. See the [changelog](CHANGELOG.md).
 
-It is not a drop-in replacement. The two cannot attach to each other's
-sessions, and the dtach-style flags atch still accepted are gone; see the
-[changelog](CHANGELOG.md).
+## 📦 Install
 
-## Why not screen or tmux
-
-Those are terminal emulators: they read what your program draws, keep their
-own picture of the screen, and redraw it on your terminal. Whatever your
-terminal can do that they have not learned yet — true colour, mouse
-protocols, the kitty keyboard protocol, images, new escape sequences — is
-lost or needs configuring.
-
-`ratch` does not sit in between. Bytes from the program reach your terminal
-unchanged, and your keys reach the program unchanged. `$TERM` stays what it
-was.
-
-The price of having no picture of the screen is that `ratch` cannot repaint
-it for you. When you attach it does two things instead: it puts your terminal
-into the modes the program switched on (alternate screen, mouse reporting,
-bracketed paste, keyboard protocol), and it tells the program that the window
-changed, which makes full-screen programs repaint themselves. For programs
-that just print, it replays the recent output.
-
-If you want windows, panes and a status line, use tmux; it is very good at
-them.
-
-## Install
-
-Download a binary from the [releases page](https://github.com/s85io/ratch/releases),
-or build it:
+Download a binary from the [releases page](https://github.com/s85io/ratch/releases), or build it:
 
 ```sh
 cargo build --release      # target/release/ratch
-make install               # into /usr/local, with man page and completions
+make install               # /usr/local: binary, man page, completions
 ```
 
-Linux binaries are fully static. On macOS and FreeBSD the only dependency is
-the system C library.
+Packaging for Arch, Debian, Gentoo and Homebrew is in [`pkg/`](pkg).
 
-## Usage
+## 🚀 Usage
 
 ```
 ratch [options] <session> [command...]   attach to a session, creating it if needed
 ratch [options] <command> ...
 ```
 
-A session name is a plain word. A name containing `/` is taken as the path of
-the session's socket, for sessions kept somewhere of your choosing.
+Without a command, a session runs your `$SHELL`. A session name containing
+`/` is taken as the path of the session's socket.
 
-## Commands
+### Commands
 
 | Command | |
 |---|---|
 | `attach <session>` | Attach; fail if the session is not running |
 | `new <session> [command...]` | Create a session and attach |
 | `start <session> [command...]` | Create a session without attaching |
-| `run <session> [command...]` | Create a session and stay in the foreground as its master (for service managers) |
+| `run <session> [command...]` | Create a session, staying in the foreground as its master |
 | `push <session>` | Send stdin to the session as if typed |
-| `kill [-f] <session>` | Stop a session: SIGTERM, then SIGKILL after 5 s. `-f` skips the wait |
-| `wait [-t secs] <session>` | Wait for a session to end and exit with the program's status |
-| `log [-f] [-n N] <session>` | Print the session's output; `-n` the last N lines, `-f` keep following |
+| `kill [-f] <session>` | Stop a session: SIGTERM, then SIGKILL after 5 s; `-f` at once |
+| `wait [-t secs] <session>` | Wait for a session to end; exit with the program's status |
+| `log [-f] [-n N] <session>` | Print the session's output; `-n` last N lines, `-f` follow |
 | `tail [-f] [-n N] <session>` | The same, last 10 lines by default |
 | `clear [<session>]` | Forget the session's history |
 | `list [-a] [--names]` | List sessions; `-a` includes finished ones |
-| `rm <session>` / `rm -a` | Remove what a finished or dead session left behind |
+| `rm <session>` · `rm -a` | Remove what a finished or dead session left behind |
 | `rename <session> <new-name>` | Rename a running session |
 | `env [--sh\|--fish] [<session>]` | Print commands that refresh a shell's environment |
 | `current` | Print the session this shell is running in |
 
-Without a command, a session runs your `$SHELL`.
+`wait` exits with the program's exit code, `128 + N` for signal N, `124` when
+`-t` runs out, `255` when the session ended without saying how.
 
-`wait` exits with the program's own exit code, `128 + N` if signal N killed
-it, `124` if `-t` ran out first, and `255` if the session ended without
-saying how (its master was killed).
+### Options
 
-## Options
-
-Options go before the command, or after the session name.
+Before the command, or after the session name.
 
 | Option | |
 |---|---|
 | `-e <char>` | Detach character, as a character or `^X` (default `^\`) |
 | `-E` | No detach character |
-| `-n <lines>` | How much history to show on attach (default: the last 128 kB; `0`: none) |
-| `--ro` | Attach read-only: watch without typing |
-| `-R none\|clear` | `clear` wipes the screen and its scrollback before attaching |
+| `-n <lines>` | History to show on attach (default: last 128 kB; `0`: none) |
+| `--ro` | Attach read-only |
+| `-R none\|clear` | `clear` wipes the screen and scrollback before attaching |
 | `-r none\|ctrl_l\|winch` | How to ask the program to redraw (default `winch`) |
 | `-H` | Keep the session open with a shell after the command ends |
-| `-C <size>` | Log size limit, such as `128k` or `4m`; `0` keeps no log (default `1m`) |
-| `-z` | Do not interpret the suspend key (`^Z`) |
+| `-C <size>` | Log size limit such as `128k`, `4m`; `0` keeps no log (default `1m`) |
+| `-z` | Do not interpret the suspend key |
 | `-q` | Suppress messages |
-| `-t` | Assume nothing about the terminal: send it no escape sequences |
+| `-t` | Send the terminal no escape sequences |
 
-Options you always want can go in `RATCH_OPTS`:
+Defaults can go in the environment: `export RATCH_OPTS="-e ^A -R clear"`.
 
-```sh
-export RATCH_OPTS="-e ^A -R clear"
-```
-
-## Examples
+## 🧪 Examples
 
 ```sh
-# A long build you can walk away from
-ratch start build make -j8
-ratch log -f build            # watch it
-ratch wait build && notify-send "build done"
+ratch start build make -j8                 # a build you can walk away from
+ratch log -f build                         # watch it
+ratch wait build && echo "build done"      # act on how it ends
 
-# A server, kept after it exits so you can read what it said
-ratch start -H api ./server --port 8080
+ratch start -H api ./server --port 8080    # keep the session after the server exits
+ratch attach --ro api                      # look without the risk of typing
 
-# Look in on something without the risk of typing into it
-ratch attach --ro api
+echo "git pull" | ratch push work          # type into a session from a script
 
-# Send a command to a shell running in a session
-echo "git pull" | ratch push work
-
-# Tidy up
-ratch list -a
-ratch rm -a
+ratch list -a && ratch rm -a               # tidy up
 ```
 
 After attaching from a different terminal, a long-lived shell still has the
-environment of the terminal it was started from. `env` prints what changed:
+old terminal's environment (`SSH_AUTH_SOCK`, `DISPLAY`, `TERM`, …):
 
 ```sh
 eval "$(ratch env)"           # bash, zsh
 ratch env --fish | source     # fish
 ```
 
-It covers `TERM`, `COLORTERM`, `DISPLAY`, `WAYLAND_DISPLAY`, the `SSH_*`
-variables including `SSH_AUTH_SOCK`, and kitty's; name more in
-`RATCH_ENV_VARS`.
+## 📁 Files and environment
 
-## How it behaves
-
-**Nothing waits for a slow terminal.** The program's output goes into a 1 MB
-buffer in memory and each attached terminal reads from it at its own pace. A
-terminal that falls more than the buffer behind (a hung SSH connection, a
-paused screen) skips ahead; the program and the other terminals never notice.
-
-**History.** Output is also appended to `<session>.log`, trimmed to the size
-limit. Attaching replays the recent part; `log` prints all of it. A new
-session with the name of an old one starts with the old one's history.
-Recorded output often contains questions a program asked its terminal; these
-are taken out of the replay, so your terminal does not answer them again.
-
-**Leaving.** Detaching, or the program ending, switches off whatever terminal
-modes the program switched on, so you are not left with a terminal that
-reports mouse clicks into your shell.
-
-**Limits.** With no picture of the screen, what you see after attaching to a
-full-screen program is what the program repaints. One that ignores window
-changes stays blank until it draws again; `-r ctrl_l` may suit it better.
-Several terminals attached to one session share one window size: the last
-one to attach or resize sets it.
-
-## Files and environment
-
-Sessions live in `~/.cache/ratch` (or `$RATCH_SESSION_DIR`; without a home
-directory, `/tmp/.ratch-<uid>`). The directory must be yours and mode 0700.
+Sessions live in `~/.cache/ratch` (or `$RATCH_SESSION_DIR`), which must be
+yours and mode 0700.
 
 | | |
 |---|---|
 | `<session>` | the session's socket |
 | `<session>.log` | its output |
-| `<session>.info` | its process ids, command, and how it ended |
-| `<session>.env` | the environment of the terminal that attached last |
+| `<session>.info` | process ids, command, how it ended |
+| `<session>.env` | environment of the terminal that attached last |
 
-Inside a session, `RATCH_SESSION` holds the socket path, and for a session
-started within a session, the chain of them separated by `:`. `ratch current`
-prints it readably. A session cannot be attached, or killed without `-f`,
-from inside itself.
+| Variable | |
+|---|---|
+| `RATCH_OPTS` | options applied before the command line's |
+| `RATCH_SESSION_DIR` | where to keep sessions |
+| `RATCH_ENV_VARS` | more variable names for `env` to carry |
+| `RATCH_SESSION` | set inside a session: its socket path (a `:`-separated chain when nested) |
 
 A copy of the binary under another name keeps to itself: `foo` uses
-`~/.cache/foo`, `FOO_SESSION`, `FOO_OPTS`.
+`~/.cache/foo` and `FOO_*`.
 
-**Who can do what.** Any process running as you can attach to, type into and
-stop your sessions; nobody else can. That is the socket's permissions and
-nothing more.
+## ⚠️ Good to know
 
-**systemd.** Where logind is configured with `KillUserProcesses=yes`, sessions
-die when you log out like everything else of yours. `loginctl enable-linger`
-or starting them with `systemd-run --user --scope ratch start ...` keeps them.
+- 🔐 Any process running as you can attach to, type into and stop your sessions; nobody else can.
+- 🖼️ There is no picture of the screen: after attaching, a full-screen program repaints itself. One that ignores window changes stays blank until it draws again; try `-r ctrl_l`.
+- 📐 Terminals attached to one session share one window size: the last to attach or resize sets it.
+- 🔁 A session cannot be attached, or killed without `-f`, from inside itself.
+- 🧹 With systemd's `KillUserProcesses=yes`, sessions die at logout; `loginctl enable-linger` keeps them.
 
-## Building and testing
+## 🛠 Building and testing
 
 ```sh
 make            # cargo build --release
-make check      # unit, integration and black-box tests
+make check      # format, lint, unit, integration and black-box tests
 ```
 
-The source is in layers, each using only those below it: `cli`; `client` and
-`master`; `session` (what is on disk); `proto`, `ring` and `vt` (pure logic,
-no I/O); `sys` (the operating system, and the only place with `unsafe`).
+Layers, each using only those below: `cli` → `client`, `master` → `session`
+→ `proto`, `ring`, `vt` (pure logic) → `sys` (the only place with `unsafe`).
 
-## License
+## 📜 License
 
-GPL-2.0-or-later, the licence of [dtach](https://github.com/crigler/dtach),
-from which [atch](https://github.com/mobydeck/atch) and through it `ratch`
-descend. The history of this repository starts with atch's.
+GPL-2.0-or-later, the licence of dtach, from which atch and through it
+`ratch` descend. The history of this repository starts with atch's.
