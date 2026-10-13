@@ -8,6 +8,9 @@ two cannot attach to each other's sessions, and the dtach-style mode flags
 (`-a`, `-A`, `-c`, `-n`, `-N`, `-p`, `-k`) and one-letter command aliases
 are gone.
 
+Supported on Linux and macOS. On FreeBSD it builds, but the output of a
+program that exits right after writing can be lost.
+
 What is different from atch:
 
 - A terminal that stops reading no longer stops the program. Each attached
