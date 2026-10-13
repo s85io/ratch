@@ -349,3 +349,120 @@ fn more_clients_than_the_limit_are_turned_away_and_the_rest_served() {
         client.next(Duration::from_secs(1)) == Ev::Ack
     }));
 }
+
+fn text(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn wait_returns_how_the_program_ended() {
+    let home = Home::new("wait");
+    // An exit code, delivered to someone already waiting.
+    home.start("code", "read x; exit 7");
+    let waiter = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| home.atch(&["wait", "code"]));
+        std::thread::sleep(Duration::from_millis(300));
+        Raw::connect(&home, "code").send(ClientMsg::Input(b"\n"));
+        waiting.join().unwrap()
+    });
+    assert_eq!(waiter.status.code(), Some(7));
+    // And to someone who asks after the fact.
+    assert!(eventually(SOON, || !home.file("code").exists()));
+    assert_eq!(home.atch(&["wait", "code"]).status.code(), Some(7));
+
+    // Still running when the patience runs out.
+    home.start("slow", "sleep 1000");
+    let out = home.atch(&["wait", "-t", "0.3", "slow"]);
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out));
+    // Killed by a signal: reported the way a shell would.
+    assert!(home.atch(&["kill", "-f", "slow"]).status.success());
+    assert_eq!(home.atch(&["wait", "slow"]).status.code(), Some(128 + 9));
+
+    // Never existed.
+    let out = home.atch(&["wait", "nobody"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out).contains("does not exist"));
+}
+
+#[test]
+fn wait_admits_it_when_the_master_dies_without_a_word() {
+    let home = Home::new("waitdead");
+    let mut master = home
+        .command()
+        .args(["run", "s", "sleep", "1000"])
+        .spawn()
+        .unwrap();
+    assert!(eventually(SOON, || home.file("s.info").exists()));
+    let out = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| home.atch(&["wait", "s"]));
+        std::thread::sleep(Duration::from_millis(300));
+        master.kill().unwrap();
+        master.wait().unwrap();
+        waiting.join().unwrap()
+    });
+    assert_eq!(out.status.code(), Some(255));
+}
+
+#[test]
+fn log_shows_everything_and_tail_the_end_alive_or_dead() {
+    let home = Home::new("log");
+    home.start(
+        "s",
+        "i=1; while [ $i -le 30 ]; do printf 'line%02d\\n' $i; i=$((i+1)); done; sleep 1000",
+    );
+    assert!(eventually(SOON, || text(&home.atch(&["log", "s"])).contains("line30")));
+    let all = text(&home.atch(&["log", "s"]));
+    assert!(all.contains("line01") && all.contains("line30"), "{all}");
+    let last = text(&home.atch(&["log", "-n", "3", "s"]));
+    assert!(
+        last.contains("line28") && !last.contains("line27"),
+        "{last}"
+    );
+    let tail = text(&home.atch(&["tail", "s"]));
+    assert!(
+        tail.contains("line21") && !tail.contains("line20"),
+        "{tail}"
+    );
+
+    assert!(home.atch(&["kill", "-f", "s"]).status.success());
+    let after = text(&home.atch(&["log", "s"]));
+    assert!(
+        after.contains("line01") && after.contains("ended after"),
+        "{after}"
+    );
+}
+
+#[test]
+fn a_mistyped_command_does_not_become_a_session() {
+    let home = Home::new("typo");
+    let out = home.atch(&["kil", "work"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out).contains("did you mean 'kill'"), "{}", text(&out));
+    assert_eq!(text(&home.atch(&["list", "-a"])).trim(), "(no sessions)");
+    // A session that really has such a name is still reachable by it.
+    home.start("logs", "sleep 1000");
+    let out = home.atch(&["logs"]);
+    assert!(text(&out).contains("requires a terminal"), "{}", text(&out));
+}
+
+#[test]
+fn a_session_is_not_killed_from_inside_by_accident() {
+    let home = Home::new("selfkill");
+    let report = home.0.join("report");
+    home.start(
+        "s",
+        &format!(
+            "{} kill s > {r} 2>&1; echo rc=$? >> {r}; sleep 1000",
+            common::ATCH,
+            r = report.display()
+        ),
+    );
+    assert!(eventually(SOON, || std::fs::read_to_string(&report)
+        .is_ok_and(|r| r.contains("rc="))));
+    let said = std::fs::read_to_string(&report).unwrap();
+    assert!(
+        said.contains("from within itself") && said.contains("rc=1"),
+        "{said}"
+    );
+    assert!(text(&home.atch(&["list"])).contains('s'));
+}

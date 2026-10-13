@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use crate::client::{self, Clear, Link, Options, Unreachable};
 use crate::master::{self, format_age};
-use crate::proto::Redraw;
+use crate::proto::{Redraw, Replay};
 use crate::session::{self, Names, Probe, Session, State};
 use crate::sys;
 
@@ -110,8 +110,13 @@ impl Cli {
             }
             let letters = bytes[1..].to_vec();
             args.next();
-            if letters == b"-" {
-                break;
+            match letters.as_slice() {
+                b"-" => break,
+                b"-ro" | b"-readonly" => {
+                    self.opts.readonly = true;
+                    continue;
+                }
+                _ => {}
             }
             for &letter in &letters {
                 let mut value = |what: &str| {
@@ -147,6 +152,16 @@ impl Cli {
                             Some("none") => Clear::None,
                             Some("move") => Clear::Move,
                             _ => return Err(self.fail("Invalid clear method specified.")),
+                        };
+                        break;
+                    }
+                    b'n' => {
+                        let lines = value("line count")?;
+                        self.opts.replay = match lines.to_str().and_then(|t| t.parse::<u32>().ok())
+                        {
+                            Some(0) => Replay::None,
+                            Some(n) => Replay::Lines(n),
+                            None => return Err(self.fail("Invalid line count specified.")),
                         };
                         break;
                     }
@@ -406,9 +421,11 @@ impl Cli {
         Ok(client::clear(&self.names, &session, self.opts.quiet))
     }
 
-    fn cmd_tail(&mut self, args: &mut Args) -> Result<i32, Failed> {
+    /// `tail` and `log` are one command with different defaults: the last
+    /// ten lines, or everything.
+    fn cmd_tail(&mut self, args: &mut Args, default_lines: u32) -> Result<i32, Failed> {
         let mut follow = false;
-        let mut lines = 10u32;
+        let mut lines = default_lines;
         let count = |cli: &Cli, text: &OsStr| {
             text.to_str()
                 .and_then(|t| t.parse::<u32>().ok())
@@ -441,6 +458,20 @@ impl Cli {
         Ok(client::tail(&self.names, &session, lines, follow))
     }
 
+    fn cmd_wait(&mut self, args: &mut Args) -> Result<i32, Failed> {
+        let mut limit = None;
+        if args.take(&["-t"]) {
+            let seconds = args.next().and_then(|t| t.to_str()?.parse::<f64>().ok());
+            match seconds.filter(|s| s.is_finite() && *s >= 0.0) {
+                Some(seconds) => limit = Some(std::time::Duration::from_secs_f64(seconds)),
+                None => return Err(self.fail("-t requires a number of seconds")),
+            }
+        }
+        let session = self.take_session(args)?;
+        self.no_more(args)?;
+        Ok(client::wait(&self.names, &session, limit))
+    }
+
     fn cmd_list(&mut self, args: &mut Args) -> Result<i32, Failed> {
         let mut all = false;
         while args.take(&["-a"]) {
@@ -458,11 +489,28 @@ impl Cli {
                 State::Stale => " [stale]",
                 State::Exited => " [exited]",
             };
+            // What the master recorded, if this is one of ours.
+            let info = self
+                .session(&entry.name)
+                .ok()
+                .and_then(|s| session::Info::read(&s));
+            let detail = match (entry.state, info) {
+                (State::Running { .. }, Some(info)) => {
+                    format!("  pid {}  {}", info.pid, info.command)
+                }
+                (State::Exited, Some(info)) => match (info.exit, info.signal) {
+                    (Some(code), _) => format!("  exit {code}"),
+                    (None, Some(sig)) => format!("  signal {sig}"),
+                    (None, None) => String::new(),
+                },
+                _ => String::new(),
+            };
             say!(
-                "{:<24} since {} ago{}",
+                "{:<24} since {} ago{}{}",
                 entry.name.to_string_lossy(),
                 age,
-                mark
+                mark,
+                detail
             );
         }
         if entries.is_empty() && !self.opts.quiet {
@@ -560,6 +608,28 @@ impl Cli {
         0
     }
 
+    /// A bare word is a session name, so a mistyped command would quietly
+    /// create a session called `kil`. Catch the near misses, unless a
+    /// session by that name is really there.
+    fn reject_typo(&self, word: &OsStr) -> Result<(), Failed> {
+        let Some(word) = word.to_str().filter(|w| w.len() >= 3) else {
+            return Ok(());
+        };
+        let Some(command) = COMMANDS.iter().find(|c| one_edit_apart(word, c)) else {
+            return Ok(());
+        };
+        let exists = self.session(OsStr::new(word)).is_ok_and(|session| {
+            !matches!(session.probe(), Probe::Missing) || session.file_exists(".log")
+        });
+        if exists {
+            return Ok(());
+        }
+        let prog = &self.names.progname;
+        say!("{prog}: unknown command '{word}' (did you mean '{command}'?)");
+        say!("To create a session with that name: {prog} new {word}");
+        Err(1)
+    }
+
     /// The dtach-style syntax: a mode flag, then the session.
     fn legacy(&mut self, mode: u8, args: &mut Args) -> Result<i32, Failed> {
         match mode {
@@ -605,10 +675,39 @@ impl Cli {
             Some("push" | "p") => self.cmd_push(args),
             Some("kill" | "k") => self.cmd_kill(args),
             Some("clear") => self.cmd_clear(args),
-            Some("tail") => self.cmd_tail(args),
+            Some("tail") => self.cmd_tail(args, 10),
+            Some("log") => self.cmd_tail(args, u32::MAX),
+            Some("wait") => self.cmd_wait(args),
             Some("rm") => self.cmd_rm(args),
-            _ => self.cmd_open(&first, args, true),
+            _ => {
+                self.reject_typo(&first)?;
+                self.cmd_open(&first, args, true)
+            }
         }
+    }
+}
+
+const COMMANDS: [&str; 13] = [
+    "attach", "new", "start", "run", "push", "kill", "clear", "tail", "log", "wait", "list", "rm",
+    "current",
+];
+
+/// One character added, removed, changed, or two neighbours swapped.
+fn one_edit_apart(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if a == b || long.len() - short.len() > 1 {
+        return false;
+    }
+    let same = short.iter().zip(long).take_while(|(x, y)| x == y).count();
+    if short.len() == long.len() {
+        let swapped = same + 1 < short.len()
+            && short[same] == long[same + 1]
+            && short[same + 1] == long[same]
+            && short[same + 2..] == long[same + 2..];
+        swapped || short[same + 1..] == long[same + 1..]
+    } else {
+        short[same..] == long[same + 1..]
     }
 }
 
@@ -635,6 +734,8 @@ Commands:
   tail    [-f] [-n N] <session>\tPrint last N lines of session output
     -f\t\t\t\tFollow output
     -n <lines>\t\t\tNumber of lines (default 10)
+  log     [-f] [-n N] <session>\tPrint all session output (or last N lines)
+  wait    [-t secs] <session>\t\tWait for session to end, exit with its code
   list    [-a]\t\t\t\tList sessions (-a includes exited)
   rm      <session> | -a\t\tRemove a stale or exited session (-a: all)
   current\t\t\t\tPrint current session name
@@ -648,6 +749,8 @@ Options:
   -q\t\tSuppress messages
   -t\t\tDisable VT100 assumptions
   -C <size>\tLog cap: 0=disable, e.g. 128k, 4m (default 1m)
+  -n <lines>\tHistory to show on attach (default: last 128k; 0=none)
+  --ro\t\tAttach read-only: watch without typing
 
 URL: {}
 ",
@@ -717,6 +820,30 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_misses_of_commands() {
+        for (typo, command) in [
+            ("kil", "kill"),
+            ("lsit", "list"),
+            ("atach", "attach"),
+            ("starr", "start"),
+            ("logs", "log"),
+            ("rnu", "run"),
+        ] {
+            assert!(one_edit_apart(typo, command), "{typo} / {command}");
+        }
+        for (word, command) in [
+            ("kill", "kill"),
+            ("work", "kill"),
+            ("ki", "kill"),
+            ("build", "kill"),
+            ("lits2", "list"),
+            ("tial5", "tail"),
+        ] {
+            assert!(!one_edit_apart(word, command), "{word} / {command}");
+        }
+    }
 
     #[test]
     fn sizes() {

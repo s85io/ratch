@@ -250,6 +250,8 @@ pub struct Options {
     /// Assume nothing about the terminal: send it no escape sequences.
     pub plain: bool,
     pub replay: Replay,
+    /// Watch without typing: keys are not passed to the program.
+    pub readonly: bool,
 }
 
 impl Default for Options {
@@ -262,6 +264,7 @@ impl Default for Options {
             quiet: false,
             plain: false,
             replay: Replay::Default,
+            readonly: false,
         }
     }
 }
@@ -419,7 +422,7 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             replay,
             rows,
             cols,
-            readonly: false,
+            readonly: opts.readonly,
             redraw: opts.redraw,
         })
     };
@@ -558,6 +561,9 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
                 farewell(&mut term, format!("detached after {}", age_since(started)));
                 return 0;
             }
+            if opts.readonly {
+                continue;
+            }
             ok &= link.send(ClientMsg::Input(keys)).is_ok();
             if keys[0] == 0x0c {
                 // The user asked for a repaint; make sure the size is right.
@@ -610,6 +616,10 @@ pub fn kill(names: &Names, session: &Session, force: bool, quiet: bool) -> i32 {
     let Some(mut link) = connect(names, session) else {
         return 1;
     };
+    if !force && in_own_ancestry(names, session, &link) {
+        say!("{prog}: cannot kill session '{name}' from within itself (use -f to do it anyway)");
+        return 1;
+    }
     let done = |how: &str| {
         if !quiet {
             say!("{prog}: session '{name}' {how}");
@@ -628,6 +638,72 @@ pub fn kill(names: &Names, session: &Session, force: bool, quiet: bool) -> i32 {
     }
     say!("{prog}: session '{name}' did not stop");
     1
+}
+
+/// Exit codes of `wait` that are not the program's own.
+pub const WAIT_TIMED_OUT: i32 = 124;
+pub const WAIT_UNKNOWN: i32 = 255;
+
+fn exit_code(exit: Exit) -> i32 {
+    match exit {
+        Exit::Code(code) => i32::from(code),
+        // As a shell reports a command killed by a signal.
+        Exit::Signal(sig) => 128 + i32::from(sig),
+    }
+}
+
+/// Block until a session ends and return the program's exit code. A session
+/// that has already ended answers from what its master recorded.
+pub fn wait(names: &Names, session: &Session, limit: Option<Duration>) -> i32 {
+    let (prog, name) = (&names.progname, session.name());
+    let mut link = match Link::open(session) {
+        Ok(link) => link,
+        Err(Unreachable::Missing) => {
+            let recorded = crate::session::Info::read(session).filter(|info| info.ended.is_some());
+            return match recorded {
+                Some(info) => match (info.exit, info.signal) {
+                    (Some(code), _) => i32::from(code),
+                    (None, Some(sig)) => 128 + i32::from(sig),
+                    (None, None) => WAIT_UNKNOWN,
+                },
+                None => {
+                    say!("{prog}: session '{name}' does not exist");
+                    1
+                }
+            };
+        }
+        Err(why) => {
+            print_unreachable(names, session, &why);
+            return 1;
+        }
+    };
+    let deadline = limit.map(|limit| Instant::now() + limit);
+    let mut exit = None;
+    loop {
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                say!("{prog}: session '{name}' is still running");
+                return WAIT_TIMED_OUT;
+            }
+            let _ = link.stream.set_read_timeout(Some(left));
+        }
+        match link.read(|event| {
+            if let Event::Exit(how) = event {
+                exit = Some(how);
+            }
+        }) {
+            Ok(true) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            // The master is gone. If it did not say how the program ended,
+            // it did not end in an orderly way and nobody knows.
+            Ok(false) | Err(_) => return exit.map_or(WAIT_UNKNOWN, exit_code),
+        }
+    }
 }
 
 /// Forget a session's history. A running session is asked to do it itself,

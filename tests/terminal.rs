@@ -315,3 +315,46 @@ fn a_session_held_by_a_c_master_can_be_attached_pushed_and_killed() {
         "{text}"
     );
 }
+
+#[test]
+fn a_read_only_attach_watches_and_cannot_type() {
+    let home = Home::new("readonly");
+    home.start("s", "cat");
+    let mut term = Term::spawn(&home, &["attach", "--ro", "s"]);
+    assert!(eventually(SOON, || home.file("s").exists()));
+    term.send(b"typed-by-the-watcher\r");
+    let mut other = common::Raw::connect(&home, "s");
+    other.send(atch::proto::ClientMsg::Input(b"typed-by-someone-else\n"));
+    term.expect("typed-by-someone-else");
+    // Our own pty may echo what we typed; what counts is what the program got.
+    let log = std::fs::read(home.file("s.log")).unwrap();
+    assert!(contains(&log, b"typed-by-someone-else") && !contains(&log, b"typed-by-the-watcher"));
+    // A watcher does not count as someone being attached.
+    assert!(!String::from_utf8_lossy(&home.atch(&["list"]).stdout).contains("[attached]"));
+    term.send(DETACH);
+    let (seen, _) = term.finish();
+    assert!(seen.contains("detached"), "{seen:?}");
+}
+
+#[test]
+fn the_amount_of_history_shown_on_attach_can_be_chosen() {
+    let home = Home::new("history");
+    home.start(
+        "s",
+        "i=1; while [ $i -le 50 ]; do printf 'line%02d\\n' $i; i=$((i+1)); done; sleep 1000",
+    );
+    assert!(eventually(SOON, || {
+        std::fs::read(home.file("s.log")).is_ok_and(|log| contains(&log, b"line50"))
+    }));
+    let mut term = Term::spawn(&home, &["attach", "s", "-n", "2"]);
+    term.expect("line50");
+    assert!(contains(&term.seen, b"line49") && !contains(&term.seen, b"line48"));
+    term.send(DETACH);
+    term.finish();
+
+    let mut term = Term::spawn(&home, &["attach", "s", "-n", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+    term.send(DETACH);
+    let (seen, _) = term.finish();
+    assert!(!seen.contains("line50"), "{seen:?}");
+}
