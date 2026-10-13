@@ -1,17 +1,72 @@
-# ratch
+<h1 align="center">ratch</h1>
 
-`ratch` keeps a terminal program running after you leave, and lets you come
-back to it later, from the same terminal or another one. It does what the
-detach feature of `screen` and `tmux` does, and nothing else: no windows, no
-panes, no status line, no terminal emulation.
+<p align="center">
+  <b>Leave a terminal program running. Come back to it later, from anywhere.</b><br>
+  Nothing between you and the program: no terminal emulation, no windows, no configuration.
+</p>
 
-```sh
-ratch work            # attach to "work", creating it (with your shell) if needed
-                      # ... Ctrl-\ detaches; the shell keeps running
-ratch work            # back where you left off
+<p align="center">
+  <a href="https://github.com/s85io/ratch/actions/workflows/ci.yml"><img src="https://github.com/s85io/ratch/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <img src="https://img.shields.io/badge/license-GPL--2.0--or--later-blue" alt="GPL-2.0-or-later">
+  <img src="https://img.shields.io/badge/binary-one%20static%20file-success" alt="one static binary">
+</p>
+
+```console
+$ ratch work                 # attach to "work"; it does not exist yet, so it is created
+ratch: session 'work' created
+$ make -j8                   # ... start something long, then press Ctrl-\
+[ratch: session 'work' detached after 12s]
+
+$ ratch list
+work                     since 3m 2s ago  pid 4242  /bin/zsh
+
+$ ratch work                 # tomorrow, from another machine over SSH
+... the build output, and your shell, right where you left them
 ```
 
-It is one static binary with no configuration file.
+## Inspired by atch
+
+`ratch` exists because of [atch](https://github.com/mobydeck/atch), and atch
+because of [dtach](https://github.com/crigler/dtach) by Ned T. Crigler.
+
+dtach had one idea and stopped there: detaching is a small problem, and it
+does not take a terminal emulator to solve it. Put the program on a
+pseudo-terminal, keep that alive, and pass bytes back and forth. Twenty
+years on, that is still why mouse, true colour, images and every new
+terminal protocol work through it without anyone having taught it about them.
+
+atch took that idea and made it pleasant to live with. Sessions got names
+instead of socket paths. `atch work` attached or created, whichever was
+needed. Output went to a log, so a session had a past: you could see what
+happened before you attached, and even after the program was gone. All of it
+in one small static binary with nothing to configure. That is the tool I
+wanted to keep using.
+
+Using it daily showed where it gave way. A terminal that stopped reading —
+a dropped SSH connection, a paused screen — stopped the program in the
+session too. Attaching from a second terminal to a full-screen program left
+mouse and alternate screen switched off; detaching left them switched on in
+your shell. Replaying the log made the terminal answer questions the program
+had asked hours ago, and the answers landed in the session as typed garbage.
+
+Fixing those meant replacing the core, so `ratch` is that: the same idea and
+the same feel, rewritten in Rust around a different centre.
+
+| | atch | ratch |
+|---|---|---|
+| A terminal that stops reading | stops the program | falls behind on its own; the program runs on |
+| Attaching to a full-screen program | modes are lost | terminal is put into the program's modes |
+| Detaching from one | modes stay on in your shell | switched off again |
+| History on attach | the whole log, replayed by the client | the recent part, served by the session, with terminal queries taken out |
+| Two people creating the same session at once | not guarded against | one wins, the other is told |
+| How a session ended | not recorded | `ratch wait` returns its exit status |
+
+What it deliberately keeps: one static binary, no configuration file, no
+terminal emulation, and `ratch <name>` doing the obvious thing.
+
+It is not a drop-in replacement. The two cannot attach to each other's
+sessions, and the dtach-style flags atch still accepted are gone; see the
+[changelog](CHANGELOG.md).
 
 ## Why not screen or tmux
 
@@ -23,7 +78,7 @@ lost or needs configuring.
 
 `ratch` does not sit in between. Bytes from the program reach your terminal
 unchanged, and your keys reach the program unchanged. `$TERM` stays what it
-was. Mouse, scrolling, colours and graphics work the way they do without it.
+was.
 
 The price of having no picture of the screen is that `ratch` cannot repaint
 it for you. When you attach it does two things instead: it puts your terminal
@@ -31,6 +86,9 @@ into the modes the program switched on (alternate screen, mouse reporting,
 bracketed paste, keyboard protocol), and it tells the program that the window
 changed, which makes full-screen programs repaint themselves. For programs
 that just print, it replays the recent output.
+
+If you want windows, panes and a status line, use tmux; it is very good at
+them.
 
 ## Install
 
@@ -203,6 +261,6 @@ no I/O); `sys` (the operating system, and the only place with `unsafe`).
 
 ## License
 
-GPL-2.0-or-later. `ratch` is a rewrite in Rust of
-[atch](https://github.com/mobydeck/atch), itself based on
-[dtach](https://github.com/crigler/dtach) by Ned T. Crigler.
+GPL-2.0-or-later, the licence of [dtach](https://github.com/crigler/dtach),
+from which [atch](https://github.com/mobydeck/atch) and through it `ratch`
+descend. The history of this repository starts with atch's.
