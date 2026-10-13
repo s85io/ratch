@@ -195,6 +195,7 @@ A copy of the binary under another name keeps to itself: `foo` uses
 - 🖼️ There is no picture of the screen: after attaching, a full-screen program repaints itself. One that ignores window changes stays blank until it draws again; try `-r ctrl_l`.
 - 📐 Terminals attached to one session share one window size: the last to attach or resize sets it.
 - 🔁 A session cannot be attached, or killed without `-f`, from inside itself.
+- 🐡 Linux and macOS are supported. On FreeBSD it builds and mostly works, but the output of a program that exits immediately after writing can be lost.
 - 🧹 With systemd's `KillUserProcesses=yes`, sessions die at logout; `loginctl enable-linger` keeps them.
 
 ## 🛠 Building and testing

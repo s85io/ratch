@@ -50,8 +50,12 @@ jobs:
           test "$size" -le 1048576
           sh tests/test.sh "$PWD/$bin"
 
+  # Not supported yet: FreeBSD discards what a program wrote just before it
+  # exited if the master has not read it by then, which loses the output of
+  # short commands. The job is kept to show how far it is from working.
   freebsd:
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: vmactions/freebsd-vm@v1

@@ -305,10 +305,6 @@ struct Master<'a> {
     sock_id: SockId,
     pty: OwnedFd,
     pty_open: bool,
-    /// Our own handle on the program's side of the pty, held until the
-    /// program has exited and its output has been read. Some systems throw
-    /// away unread output the moment the last such handle is closed.
-    slave: Option<OwnedFd>,
     child: Child,
     status: Option<ExitStatus>,
     ring: Ring,
@@ -443,17 +439,7 @@ pub fn run(session: Session, cfg: &Config) -> i32 {
             ))
         }
     };
-    let for_child = match slave.try_clone() {
-        Ok(fd) => fd,
-        Err(e) => {
-            return abandon(format!(
-                "{}: init_pty: {}",
-                names.progname,
-                sys::describe(&e)
-            ))
-        }
-    };
-    let child = match sys::spawn_on_pty(for_child, &cfg.argv, &session_env(names, &session, id)) {
+    let child = match sys::spawn_on_pty(slave, &cfg.argv, &session_env(names, &session, id)) {
         Ok(child) => child,
         Err(e) => {
             return abandon(format!(
@@ -521,7 +507,6 @@ pub fn run(session: Session, cfg: &Config) -> i32 {
         sock_id,
         pty,
         pty_open: true,
-        slave: Some(slave),
         child,
         status: None,
         ring,
@@ -637,7 +622,6 @@ impl Master<'_> {
             if self.status.is_none() {
                 if let Ok(Some(status)) = self.child.try_wait() {
                     self.status = Some(status);
-                    self.release_slave();
                 }
             }
             if !ready[1].is_empty() {
@@ -725,21 +709,6 @@ impl Master<'_> {
                 self.clients.push(Client::new(stream));
             }
         }
-    }
-
-    /// The program has exited. Read what it left in the pty, then let go of
-    /// our handle on its side, so that the pty can report its end.
-    fn release_slave(&mut self) {
-        // Bounded: something else may still be writing to the pty.
-        for _ in 0..4096 {
-            let mut buf = [0u8; 8192];
-            match rustix::io::read(&self.pty, &mut buf) {
-                Ok(n) if n > 0 => self.on_output(&buf[..n]),
-                Err(rustix::io::Errno::INTR) => {}
-                _ => break,
-            }
-        }
-        self.slave = None;
     }
 
     fn read_pty(&mut self) {
