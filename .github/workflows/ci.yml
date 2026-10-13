@@ -25,32 +25,30 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # The C implementation stays the reference until the Rust one has
-      # passed everything here on every system.
-      - name: C reference build and suite
-        run: |
-          make CC=cc
-          sh tests/test.sh "$PWD/atch"
-          cp atch /tmp/atch-c-reference
-      - name: Unit and integration tests
-        run: ATCH_C_REFERENCE=/tmp/atch-c-reference cargo test
-      - name: Black-box suite against the Rust binary
+      - name: Programs for the real-program tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y vim htop less
+      - run: cargo test
+      - name: Black-box suite
         run: |
           cargo build --release
-          sh tests/test.sh "$PWD/target/release/atch"
+          sh tests/test.sh "$PWD/target/release/ratch"
 
   musl:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add x86_64-unknown-linux-musl
-      - run: cargo build --release --target x86_64-unknown-linux-musl
       - run: cargo test --target x86_64-unknown-linux-musl
-      - name: Binary size
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Static, and not too big
         run: |
-          size=$(stat -c %s target/x86_64-unknown-linux-musl/release/atch)
+          bin=target/x86_64-unknown-linux-musl/release/ratch
+          file "$bin" | grep -q 'statically linked\|static-pie'
+          size=$(stat -c %s "$bin")
           echo "static binary: $size bytes"
           test "$size" -le 1048576
+          sh tests/test.sh "$PWD/$bin"
 
   freebsd:
     runs-on: ubuntu-latest
@@ -60,4 +58,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
-          run: cargo test
+          run: |
+            cargo test
+            cargo build --release
+            sh tests/test.sh "$PWD/target/release/ratch"

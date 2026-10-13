@@ -6,7 +6,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
-use atch::sys;
+use ratch::sys;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{Pid, Signal};
 use rustix::termios::{LocalModes, Winsize};
@@ -123,7 +123,7 @@ fn child_starts_with_default_sigpipe() {
 #[test]
 fn exec_failure_is_reported_to_the_caller() {
     let (_master, slave) = sys::open_pty(None, None).unwrap();
-    let argv = [OsString::from("/nonexistent/atch-test-program")];
+    let argv = [OsString::from("/nonexistent/ratch-test-program")];
     let err = sys::spawn_on_pty(slave, &argv, &[]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }

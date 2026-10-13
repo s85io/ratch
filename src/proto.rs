@@ -5,9 +5,7 @@
 //! Program output and keyboard input travel inside frames unchanged.
 //!
 //! A conversation opens with `Hello` from the client and `HelloAck` from the
-//! master. `Hello` is eight bytes on purpose: the C master this replaces
-//! reads ten-byte packets and hangs up on anything shorter, which is how a
-//! client recognises one.
+//! master.
 
 #![forbid(unsafe_code)]
 
@@ -77,6 +75,9 @@ pub struct Attach {
     pub cols: u16,
     /// Watch only: this client's input is not passed to the program.
     pub readonly: bool,
+    /// Just the bytes: history whatever the program is doing now, and no
+    /// attempt to set a terminal up for it. For reading output, not viewing.
+    pub dump: bool,
     pub redraw: Redraw,
 }
 
@@ -107,6 +108,8 @@ pub enum ClientMsg<'a> {
     Signal(u8),
     /// Forget the history, in memory and on disk.
     Clear,
+    /// Take a new name.
+    Rename(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +137,7 @@ mod kind {
     pub const REDRAW: u8 = 6;
     pub const SIGNAL: u8 = 7;
     pub const CLEAR: u8 = 8;
+    pub const RENAME: u8 = 9;
 
     pub const HELLO_ACK: u8 = 0x81;
     pub const OUTPUT: u8 = 0x82;
@@ -145,6 +149,7 @@ mod kind {
 }
 
 const FLAG_READONLY: u8 = 1;
+const FLAG_DUMP: u8 = 2;
 const FLAG_SIGNALED: u8 = 1;
 
 fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, payload: &[u8]) {
@@ -188,12 +193,8 @@ impl ClientMsg<'_> {
                 p[4..6].copy_from_slice(&a.rows.to_le_bytes());
                 p[6..8].copy_from_slice(&a.cols.to_le_bytes());
                 p[8] = a.redraw as u8;
-                frame(
-                    out,
-                    kind::ATTACH,
-                    if a.readonly { FLAG_READONLY } else { 0 },
-                    &p,
-                );
+                let flags = (u8::from(a.readonly) * FLAG_READONLY) | (u8::from(a.dump) * FLAG_DUMP);
+                frame(out, kind::ATTACH, flags, &p);
             }
             ClientMsg::Detach => frame(out, kind::DETACH, 0, &[]),
             ClientMsg::Input(data) => frames(out, kind::INPUT, data),
@@ -212,6 +213,7 @@ impl ClientMsg<'_> {
             }
             ClientMsg::Signal(sig) => frame(out, kind::SIGNAL, 0, &[sig]),
             ClientMsg::Clear => frame(out, kind::CLEAR, 0, &[]),
+            ClientMsg::Rename(name) => frame(out, kind::RENAME, 0, &name[..name.len().min(255)]),
         }
     }
 
@@ -231,6 +233,7 @@ impl ClientMsg<'_> {
                 rows: u16_at(p, 4),
                 cols: u16_at(p, 6),
                 readonly: f.flags & FLAG_READONLY != 0,
+                dump: f.flags & FLAG_DUMP != 0,
                 redraw: Redraw::from_u8(p[8]).ok_or(bad)?,
             }),
             (kind::DETACH, 0) => ClientMsg::Detach,
@@ -246,7 +249,8 @@ impl ClientMsg<'_> {
             },
             (kind::SIGNAL, 1) => ClientMsg::Signal(p[0]),
             (kind::CLEAR, 0) => ClientMsg::Clear,
-            (kind::HELLO..=kind::CLEAR, _) => return Err(bad),
+            (kind::RENAME, 1..=255) => ClientMsg::Rename(p),
+            (kind::HELLO..=kind::RENAME, _) => return Err(bad),
             (other, _) => return Err(ProtoError::UnknownType(other)),
         })
     }
@@ -370,6 +374,7 @@ mod tests {
                 rows: 50,
                 cols: 200,
                 readonly: true,
+                dump: true,
                 redraw: Redraw::CtrlL,
             }),
             ClientMsg::Attach(Attach {
@@ -387,6 +392,7 @@ mod tests {
             },
             ClientMsg::Signal(15),
             ClientMsg::Clear,
+            ClientMsg::Rename(b"new-name"),
         ]
     }
 
@@ -405,13 +411,6 @@ mod tests {
             ServerMsg::Ack,
             ServerMsg::Error("session is full"),
         ]
-    }
-
-    #[test]
-    fn hello_is_eight_bytes() {
-        let mut bytes = Vec::new();
-        ClientMsg::Hello { version: VERSION }.encode(&mut bytes);
-        assert_eq!(bytes.len(), 8);
     }
 
     #[test]
@@ -516,11 +515,6 @@ mod tests {
         let mut decoder = Decoder::new();
         decoder.extend(&[kind::INPUT, 0, 0xff, 0xff]);
         assert_eq!(decoder.next().unwrap_err(), ProtoError::TooLong(0xffff));
-        // An old C packet (ten bytes, type 1 = attach) is not a valid hello.
-        let mut decoder = Decoder::new();
-        decoder.extend(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let frame = decoder.next().unwrap().unwrap();
-        assert!(ClientMsg::decode(&frame).is_err());
     }
 
     #[test]

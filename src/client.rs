@@ -33,44 +33,35 @@ pub enum Event<'a> {
     Error(&'a str),
 }
 
-/// A connection to a master, either one of ours or the C implementation
-/// this replaces (`v1`), which a session started before an upgrade still runs.
+/// A connection to a master.
 pub struct Link {
     stream: UnixStream,
     decoder: Decoder,
-    v1: bool,
-    /// The master's session id; a v1 master has none.
-    pub session_id: Option<u64>,
+    /// Which session this is, whatever it is called now.
+    pub session_id: u64,
 }
 
 const GREETING_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Link {
     pub fn open(session: &Session) -> Result<Link, Unreachable> {
-        let connect = || match session.probe() {
-            Probe::Live(stream) => Ok(stream),
-            Probe::Missing => Err(Unreachable::Missing),
-            Probe::Stale => Err(Unreachable::Stale),
-            Probe::NotASocket => Err(Unreachable::NotASocket),
-            Probe::Failed(e) => Err(Unreachable::Failed(e)),
+        let stream = match session.probe() {
+            Probe::Live(stream) => stream,
+            Probe::Missing => return Err(Unreachable::Missing),
+            Probe::Stale => return Err(Unreachable::Stale),
+            Probe::NotASocket => return Err(Unreachable::NotASocket),
+            Probe::Failed(e) => return Err(Unreachable::Failed(e)),
         };
-        let stream = connect()?;
         let mut link = Link {
             stream,
             decoder: Decoder::new(),
-            v1: false,
-            session_id: None,
+            session_id: 0,
         };
         match link.greet() {
             Ok(true) => Ok(link),
-            // It hung up on our greeting, as the C master does on anything
-            // that is not one of its ten-byte packets. Start over, its way.
-            Ok(false) => Ok(Link {
-                stream: connect()?,
-                decoder: Decoder::new(),
-                v1: true,
-                session_id: None,
-            }),
+            Ok(false) => Err(Unreachable::Failed(io::Error::other(
+                "session did not answer",
+            ))),
             Err(e) => Err(Unreachable::Failed(e)),
         }
     }
@@ -84,7 +75,7 @@ impl Link {
             if let Some(frame) = self.decoder.next().map_err(io::Error::other)? {
                 return match ServerMsg::decode(&frame) {
                     Ok(ServerMsg::HelloAck { session, .. }) => {
-                        self.session_id = Some(session);
+                        self.session_id = session;
                         let _ = self.stream.set_read_timeout(None);
                         Ok(true)
                     }
@@ -105,17 +96,9 @@ impl Link {
         }
     }
 
-    pub fn is_v1(&self) -> bool {
-        self.v1
-    }
-
     pub fn send(&mut self, msg: ClientMsg<'_>) -> io::Result<()> {
         let mut bytes = Vec::new();
-        if self.v1 {
-            v1::encode(&msg, &mut bytes);
-        } else {
-            msg.encode(&mut bytes);
-        }
+        msg.encode(&mut bytes);
         self.stream.write_all(&bytes)
     }
 
@@ -130,10 +113,6 @@ impl Link {
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
             Err(e) => return Err(e),
         };
-        if self.v1 {
-            on(Event::Output(&buf[..n]));
-            return Ok(true);
-        }
         self.decoder.extend(&buf[..n]);
         while let Some(frame) = self.decoder.next().map_err(io::Error::other)? {
             on(match ServerMsg::decode(&frame).map_err(io::Error::other)? {
@@ -177,75 +156,14 @@ impl AsFd for Link {
     }
 }
 
-/// The packets of the C master: `struct packet { u8 type; u8 len; union {
-/// u8 buf[8]; struct winsize ws; } }`, native byte order, ten bytes.
-mod v1 {
-    use super::ClientMsg;
-
-    const PUSH: u8 = 0;
-    const ATTACH: u8 = 1;
-    const DETACH: u8 = 2;
-    const WINCH: u8 = 3;
-    const REDRAW: u8 = 4;
-    const KILL: u8 = 5;
-
-    fn packet(out: &mut Vec<u8>, kind: u8, len: u8, body: [u8; 8]) {
-        out.extend_from_slice(&[kind, len]);
-        out.extend_from_slice(&body);
-    }
-
-    fn winsize(rows: u16, cols: u16) -> [u8; 8] {
-        let (r, c) = (rows.to_ne_bytes(), cols.to_ne_bytes());
-        [r[0], r[1], c[0], c[1], 0, 0, 0, 0]
-    }
-
-    pub fn encode(msg: &ClientMsg<'_>, out: &mut Vec<u8>) {
-        match *msg {
-            ClientMsg::Input(data) => {
-                for chunk in data.chunks(8) {
-                    let mut body = [0u8; 8];
-                    body[..chunk.len()].copy_from_slice(chunk);
-                    packet(out, PUSH, chunk.len() as u8, body);
-                }
-            }
-            ClientMsg::Attach(attach) => {
-                // Length 0 asks for the master's own in-memory history.
-                packet(out, ATTACH, 0, [0; 8]);
-                packet(
-                    out,
-                    REDRAW,
-                    attach.redraw as u8,
-                    winsize(attach.rows, attach.cols),
-                );
-            }
-            ClientMsg::Detach => packet(out, DETACH, 0, [0; 8]),
-            ClientMsg::Resize { rows, cols } => packet(out, WINCH, 0, winsize(rows, cols)),
-            ClientMsg::Redraw { method, rows, cols } => {
-                packet(out, REDRAW, method as u8, winsize(rows, cols));
-            }
-            ClientMsg::Signal(sig) => packet(out, KILL, sig, [0; 8]),
-            // Not something a v1 master understands.
-            ClientMsg::Hello { .. } | ClientMsg::Clear => {}
-        }
-    }
-}
-
-/// What `-R` chose to do with the screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Clear {
-    #[default]
-    Unspec,
-    None,
-    Move,
-}
-
 #[derive(Clone, Debug)]
 pub struct Options {
     /// The key that detaches; `None` if disabled.
     pub detach: Option<u8>,
     pub no_suspend: bool,
     pub redraw: Redraw,
-    pub clear: Clear,
+    /// Wipe the screen and its scrollback before showing the session.
+    pub clear: bool,
     pub quiet: bool,
     /// Assume nothing about the terminal: send it no escape sequences.
     pub plain: bool,
@@ -260,7 +178,7 @@ impl Default for Options {
             detach: Some(0x1c),
             no_suspend: false,
             redraw: Redraw::Unspec,
-            clear: Clear::Unspec,
+            clear: false,
             quiet: false,
             plain: false,
             replay: Replay::Default,
@@ -372,21 +290,15 @@ fn age_since(start: SystemTime) -> String {
 }
 
 /// Is this session one the calling process is running inside of?
-fn in_own_ancestry(names: &Names, session: &Session, link: &Link) -> bool {
-    let var = names.session_var();
-    let chain_has = |var: String, wanted: &str| {
-        std::env::var(var).is_ok_and(|chain| chain.split(':').any(|item| item == wanted))
-    };
-    match link.session_id {
-        Some(id) => chain_has(format!("{var}_ID"), &format!("{id:016x}")),
-        None => chain_has(var, &session.sock.to_string_lossy()),
-    }
+fn in_own_ancestry(names: &Names, link: &Link) -> bool {
+    let wanted = format!("{:016x}", link.session_id);
+    std::env::var(names.id_var()).is_ok_and(|chain| chain.split(':').any(|id| id == wanted))
 }
 
 /// Attach the terminal to a session until the user detaches or it ends.
 pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) -> i32 {
     let (prog, name) = (names.progname.as_str(), session.name());
-    if in_own_ancestry(names, session, &link) {
+    if in_own_ancestry(names, &link) {
         say!("{prog}: cannot attach to session '{name}' from within itself");
         return 1;
     }
@@ -405,15 +317,11 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
     };
     let started = session.started().unwrap_or_else(SystemTime::now);
     // Where a parting message goes: the bottom of the screen, if we may move.
-    let place = if opts.plain || opts.clear == Clear::None {
-        "\r\n"
-    } else {
-        "\x1b[999H\r\n"
-    };
+    let place = if opts.plain { "\r\n" } else { "\x1b[999H\r\n" };
     let suspend_key = sys::suspend_key(&term.original);
 
     term.enter();
-    if opts.clear == Clear::Move && !opts.plain {
+    if opts.clear && !opts.plain {
         let _ = term.write(b"\x1b[H\x1b[2J\x1b[3J");
     }
     let attach_msg = |replay| {
@@ -423,14 +331,18 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             rows,
             cols,
             readonly: opts.readonly,
+            dump: false,
             redraw: opts.redraw,
         })
     };
     let mut ok = link.send(attach_msg(opts.replay)).is_ok();
     // While history is being played, the terminal may be answering queries
     // in it. Those answers arrive on stdin like typing and are picked out.
-    // A v1 master never says when history ends, so nothing is filtered.
-    let mut replies = (!link.is_v1()).then(crate::vt::Filter::replies);
+    let mut replies = Some(crate::vt::Filter::replies());
+    if !opts.readonly {
+        // For `env`: what this terminal's surroundings look like.
+        let _ = crate::session::Env::capture(names).write(session);
+    }
 
     let farewell = |term: &mut Terminal, text: String| {
         term.reset_modes();
@@ -553,7 +465,7 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
                 // Back in the foreground.
                 term.enter();
                 ok &= link.send(attach_msg(opts.replay)).is_ok();
-                replies = (!link.is_v1()).then(crate::vt::Filter::replies);
+                replies = Some(crate::vt::Filter::replies());
                 continue;
             }
             if opts.detach == Some(keys[0]) {
@@ -616,7 +528,7 @@ pub fn kill(names: &Names, session: &Session, force: bool, quiet: bool) -> i32 {
     let Some(mut link) = connect(names, session) else {
         return 1;
     };
-    if !force && in_own_ancestry(names, session, &link) {
+    if !force && in_own_ancestry(names, &link) {
         say!("{prog}: cannot kill session '{name}' from within itself (use -f to do it anyway)");
         return 1;
     }
@@ -706,13 +618,54 @@ pub fn wait(names: &Names, session: &Session, limit: Option<Duration>) -> i32 {
     }
 }
 
+/// Give a running session a new name.
+pub fn rename(names: &Names, session: &Session, new_name: &std::ffi::OsStr, quiet: bool) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+    let (prog, name) = (&names.progname, session.name());
+    let Some(mut link) = connect(names, session) else {
+        return 1;
+    };
+    let mut answer = None;
+    if link.send(ClientMsg::Rename(new_name.as_bytes())).is_ok() {
+        while answer.is_none() {
+            let open = link.read(|event| match event {
+                Event::Ack => answer = Some(Ok(())),
+                Event::Error(text) => answer = Some(Err(text.to_owned())),
+                _ => {}
+            });
+            if !matches!(open, Ok(true)) {
+                break;
+            }
+        }
+    }
+    match answer {
+        Some(Ok(())) => {
+            if !quiet {
+                say!(
+                    "{prog}: session '{name}' renamed to '{}'",
+                    new_name.to_string_lossy()
+                );
+            }
+            0
+        }
+        Some(Err(why)) => {
+            say!("{prog}: cannot rename session '{name}': {why}");
+            1
+        }
+        None => {
+            say!("{prog}: session '{name}' did not answer");
+            1
+        }
+    }
+}
+
 /// Forget a session's history. A running session is asked to do it itself,
 /// or what it holds in memory would bring the history back.
 pub fn clear(names: &Names, session: &Session, quiet: bool) -> i32 {
     let (prog, name) = (&names.progname, session.name());
     let mut cleared = false;
     if let Ok(mut link) = Link::open(session) {
-        if !link.is_v1() && link.send(ClientMsg::Clear).is_ok() {
+        if link.send(ClientMsg::Clear).is_ok() {
             let _ = link.read(|event| cleared |= matches!(event, Event::Ack));
         }
     }
@@ -737,42 +690,74 @@ pub fn clear(names: &Names, session: &Session, quiet: bool) -> i32 {
     0
 }
 
+/// Where `log` and `tail` write. Recorded output is full of instructions to
+/// a terminal; when stdout is one, the questions are taken out and whatever
+/// modes the output switches on are switched off again at the end.
+struct Printer {
+    terminal: Option<(crate::vt::Filter, Parser, Modes)>,
+}
+
+impl Printer {
+    fn new() -> Printer {
+        let terminal = sys::stdout_is_terminal()
+            .then(|| (crate::vt::Filter::queries(), Parser::new(), Modes::new()));
+        Printer { terminal }
+    }
+
+    fn print(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let Some((filter, parser, modes)) = self.terminal.as_mut() else {
+            return sys::write_stdout(bytes);
+        };
+        let mut kept = Vec::new();
+        filter.feed(bytes, &mut kept);
+        parser.feed(&kept, |token| modes.apply(&token));
+        sys::write_stdout(&kept)
+    }
+
+    fn finish(&mut self) {
+        if let Some((_, _, modes)) = self.terminal.take() {
+            let mut bytes = b"\x18\x1b\\".to_vec();
+            modes.reset(&mut bytes);
+            bytes.extend_from_slice(b"\x1b[0m\x1b[?25h");
+            let _ = sys::write_stdout(&bytes);
+        }
+    }
+}
+
 /// Print the last `lines` lines of a session's output, and with `follow`,
 /// what comes after. A running session is asked; a finished one is read
 /// from its log.
 pub fn tail(names: &Names, session: &Session, lines: u32, follow: bool) -> i32 {
     let (prog, name) = (&names.progname, session.name());
+    let mut printer = Printer::new();
     if let Ok(mut link) = Link::open(session) {
-        if !link.is_v1() {
-            let watch = Attach {
-                replay: Replay::Lines(lines),
-                readonly: true,
-                ..Attach::default()
-            };
-            if link.send(ClientMsg::Attach(watch)).is_err() {
-                return 1;
-            }
-            let mut live = false;
-            loop {
-                let mut output = Vec::new();
-                let open = link.read(|event| match event {
-                    Event::Output(data) if follow || !live => output.extend_from_slice(data),
-                    Event::ReplayEnd => live = true,
-                    _ => {}
-                });
-                if sys::write_stdout(&output).is_err() {
-                    return 0;
-                }
-                match open {
-                    Ok(true) if follow || !live => {}
-                    _ => return 0,
-                }
+        let watch = Attach {
+            replay: Replay::Lines(lines),
+            readonly: true,
+            dump: true,
+            ..Attach::default()
+        };
+        if link.send(ClientMsg::Attach(watch)).is_err() {
+            return 1;
+        }
+        let mut live = false;
+        loop {
+            let mut output = Vec::new();
+            let open = link.read(|event| match event {
+                Event::Output(data) if follow || !live => output.extend_from_slice(data),
+                Event::ReplayEnd => live = true,
+                _ => {}
+            });
+            let printed = printer.print(&output);
+            if printed.is_err() || !matches!(open, Ok(true)) || (live && !follow) {
+                printer.finish();
+                return 0;
             }
         }
     }
 
+    // Nobody is writing a finished session's log; there is nothing to follow.
     use rustix::fs::OFlags;
-    use std::io::{Seek, SeekFrom};
     let mut file = match session.open_file(".log", OFlags::RDONLY) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -792,38 +777,9 @@ pub fn tail(names: &Names, session: &Session, lines: u32, follow: bool) -> i32 {
     if file.read_to_end(&mut log).is_err() {
         return 1;
     }
-    let mut filter = sys::stdout_is_terminal().then(crate::vt::Filter::queries);
-    let mut show = |bytes: &[u8]| match filter.as_mut() {
-        Some(filter) => {
-            let mut kept = Vec::new();
-            filter.feed(bytes, &mut kept);
-            sys::write_stdout(&kept)
-        }
-        None => sys::write_stdout(bytes),
-    };
-    if show(&log[tail_start(&log, lines)..]).is_err() || !follow {
-        return 0;
-    }
-    // A log is only still growing if a v1 master is writing it.
-    let mut at = log.len() as u64;
-    loop {
-        std::thread::sleep(Duration::from_millis(250));
-        let len = file.metadata().map_or(at, |m| m.len());
-        if len < at {
-            at = 0; // rotated
-        }
-        let mut more = Vec::new();
-        if file.seek(SeekFrom::Start(at)).is_err() || file.read_to_end(&mut more).is_err() {
-            return 0;
-        }
-        at += more.len() as u64;
-        if show(&more).is_err() {
-            return 0;
-        }
-        if more.is_empty() && !matches!(session.probe(), Probe::Live(_)) {
-            return 0;
-        }
-    }
+    let _ = printer.print(&log[tail_start(&log, lines)..]);
+    printer.finish();
+    0
 }
 
 /// Offset in `log` where its last `lines` lines begin.
@@ -854,26 +810,5 @@ mod tests {
         assert_eq!(tail_start(log, 9), 0);
         assert_eq!(tail_start(b"one\ntwo", 1), 4);
         assert_eq!(tail_start(b"", 5), 0);
-    }
-
-    #[test]
-    fn v1_packets_are_ten_bytes_and_carry_at_most_eight() {
-        let mut out = Vec::new();
-        v1::encode(&ClientMsg::Input(b"0123456789"), &mut out);
-        assert_eq!(
-            out,
-            [
-                0, 8, b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', 0, 2, b'8', b'9', 0, 0, 0, 0,
-                0, 0
-            ]
-        );
-        out.clear();
-        v1::encode(&ClientMsg::Signal(9), &mut out);
-        assert_eq!(out, [5, 9, 0, 0, 0, 0, 0, 0, 0, 0]);
-        out.clear();
-        v1::encode(&ClientMsg::Resize { rows: 24, cols: 80 }, &mut out);
-        assert_eq!(out.len(), 10);
-        assert_eq!(u16::from_ne_bytes([out[2], out[3]]), 24);
-        assert_eq!(u16::from_ne_bytes([out[4], out[5]]), 80);
     }
 }

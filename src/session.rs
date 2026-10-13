@@ -25,20 +25,25 @@ use crate::sys;
 /// environment variable is named, so that a renamed copy keeps to itself.
 #[derive(Clone, Debug)]
 pub struct Names {
-    /// `argv[0]` as given; used in messages.
+    /// The name the program was run as, without its directory.
     pub progname: String,
-    base: String,
 }
 
 impl Names {
     pub fn new(argv0: &OsStr) -> Names {
-        let progname = argv0.to_string_lossy().into_owned();
-        let base = progname.rsplit('/').next().unwrap_or(&progname).to_owned();
-        Names { progname, base }
+        let given = argv0.to_string_lossy();
+        let progname = given
+            .rsplit('/')
+            .next()
+            .filter(|b| !b.is_empty())
+            .unwrap_or("ratch");
+        Names {
+            progname: progname.to_owned(),
+        }
     }
 
     fn upper(&self) -> String {
-        self.base
+        self.progname
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() {
@@ -55,6 +60,21 @@ impl Names {
         format!("{}_SESSION", self.upper())
     }
 
+    /// The same chain, by session id: names can change, ids do not.
+    pub fn id_var(&self) -> String {
+        format!("{}_SESSION_ID", self.upper())
+    }
+
+    /// Options applied before those on the command line.
+    pub fn opts_var(&self) -> String {
+        format!("{}_OPTS", self.upper())
+    }
+
+    /// More variable names for `env` to carry, separated by spaces or commas.
+    pub fn env_vars_var(&self) -> String {
+        format!("{}_ENV_VARS", self.upper())
+    }
+
     /// Overrides the directory sessions are kept in.
     pub fn dir_var(&self) -> String {
         format!("{}_SESSION_DIR", self.upper())
@@ -68,8 +88,8 @@ impl Names {
             .filter(|h| !h.is_empty())
             .or_else(|| sys::passwd_field(5).map(OsString::from));
         match home.filter(|h| h != "/") {
-            Some(home) => Path::new(&home).join(".cache").join(&self.base),
-            None => PathBuf::from(format!("/tmp/.{}-{}", self.base, sys::uid())),
+            Some(home) => Path::new(&home).join(".cache").join(&self.progname),
+            None => PathBuf::from(format!("/tmp/.{}-{}", self.progname, sys::uid())),
         }
     }
 }
@@ -333,6 +353,47 @@ impl Session {
         }
     }
 
+    /// Give the session a new name: the socket and every file beside it.
+    /// The caller holds the lock. On refusal, says why.
+    pub fn rename(&mut self, new: &OsStr) -> Result<(), String> {
+        let bytes = new.as_bytes();
+        if bytes.is_empty() || bytes.len() > 200 || bytes[0] == b'.' || bytes[0] == b'-' {
+            return Err("not a usable session name".into());
+        }
+        if bytes
+            .iter()
+            .any(|&b| b == b'/' || b == 0 || b == b':' || b.is_ascii_control())
+        {
+            return Err("a session name cannot contain '/', ':' or control characters".into());
+        }
+        let exists =
+            |name: &OsStr| rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        let mut log = new.to_owned();
+        log.push(".log");
+        if exists(new) {
+            return Err(format!(
+                "a session named '{}' already exists",
+                new.to_string_lossy()
+            ));
+        }
+        if exists(&log) {
+            return Err(format!(
+                "'{0}' has history from an earlier session (remove it with: rm {0})",
+                new.to_string_lossy()
+            ));
+        }
+        rustix::fs::renameat(&self.dir, &self.file, &self.dir, new)
+            .map_err(|e| sys::describe(&io::Error::from(e)))?;
+        for ext in [".log", ".info", ".env"] {
+            let mut to = new.to_owned();
+            to.push(ext);
+            let _ = rustix::fs::renameat(&self.dir, self.sidecar(ext), &self.dir, to);
+        }
+        self.sock = self.sock.with_file_name(new);
+        self.file = new.to_owned();
+        Ok(())
+    }
+
     /// The owner-execute bit on the socket says "a client is attached". It
     /// costs nothing to read, which is what makes `list` cheap.
     pub fn set_attached(&self, attached: bool) {
@@ -416,7 +477,7 @@ impl Info {
 }
 
 /// Keep a value on one line: backslash and newline become `\\` and `\n`.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -428,7 +489,7 @@ fn escape(value: &str) -> String {
     out
 }
 
-fn unescape(value: &str) -> String {
+pub(crate) fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
@@ -443,6 +504,109 @@ fn unescape(value: &str) -> String {
         }
     }
     out
+}
+
+/// The variables that tie a shell to the terminal it was started from, and
+/// go stale when a session is attached from somewhere else.
+const TERMINAL_VARS: [&str; 11] = [
+    "TERM",
+    "COLORTERM",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "KITTY_LISTEN_ON",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+];
+
+fn is_variable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The terminal-related environment of the client that attached last.
+/// Each variable is either set to a value or known to be absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Env(pub Vec<(String, Option<String>)>);
+
+impl Env {
+    /// Take a snapshot of the calling process's environment.
+    pub fn capture(names: &Names) -> Env {
+        let extra = std::env::var(names.env_vars_var()).unwrap_or_default();
+        let wanted = TERMINAL_VARS.iter().map(|v| (*v).to_owned()).chain(
+            extra
+                .split([' ', ','])
+                .filter(|n| is_variable_name(n))
+                .map(str::to_owned),
+        );
+        let mut vars: Vec<(String, Option<String>)> = Vec::new();
+        for name in wanted {
+            if !vars.iter().any(|(seen, _)| *seen == name) {
+                let value = std::env::var(&name).ok();
+                vars.push((name, value));
+            }
+        }
+        Env(vars)
+    }
+
+    pub fn write(&self, session: &Session) -> io::Result<()> {
+        let mut text = String::new();
+        for (name, value) in &self.0 {
+            match value {
+                Some(value) => text.push_str(&format!("{name}={}\n", escape(value))),
+                None => text.push_str(&format!("!{name}\n")),
+            }
+        }
+        session.replace_file(".env", text.as_bytes())
+    }
+
+    pub fn read(session: &Session) -> Option<Env> {
+        let mut text = String::new();
+        session
+            .open_file(".env", OFlags::RDONLY)
+            .ok()?
+            .take(1 << 20)
+            .read_to_string(&mut text)
+            .ok()?;
+        let vars = text
+            .lines()
+            .filter_map(|line| match line.strip_prefix('!') {
+                Some(name) => Some((name.to_owned(), None)),
+                None => line
+                    .split_once('=')
+                    .map(|(n, v)| (n.to_owned(), Some(unescape(v)))),
+            })
+            .filter(|(name, _)| is_variable_name(name))
+            .collect();
+        Some(Env(vars))
+    }
+
+    /// Commands that make a shell's environment match this one. Values are
+    /// quoted so that nothing in them is ever interpreted.
+    pub fn shell_commands(&self, fish: bool) -> String {
+        let mut out = String::new();
+        for (name, value) in &self.0 {
+            let line = match (value, fish) {
+                (Some(v), false) => format!("export {name}='{}'\n", v.replace('\'', "'\\''")),
+                (None, false) => format!("unset {name}\n"),
+                (Some(v), true) => {
+                    format!(
+                        "set -gx {name} '{}'\n",
+                        v.replace('\\', "\\\\").replace('\'', "\\'")
+                    )
+                }
+                (None, true) => format!("set -e {name}\n"),
+            };
+            out.push_str(&line);
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,7 +683,7 @@ mod tests {
     impl Scratch {
         fn new(tag: &str) -> Scratch {
             // Short on purpose: socket paths must fit in sun_path.
-            let path = PathBuf::from(format!("/tmp/atch-t{}-{tag}", std::process::id()));
+            let path = PathBuf::from(format!("/tmp/ratch-t{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir(&path).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -528,7 +692,7 @@ mod tests {
 
         fn session(&self, name: &str) -> Session {
             Session::open(
-                &Names::new(OsStr::new("atch")),
+                &Names::new(OsStr::new("ratch")),
                 self.0.join(name).as_os_str(),
             )
             .unwrap()
@@ -546,8 +710,12 @@ mod tests {
         let names = Names::new(OsStr::new("/usr/local/bin/ssh2incus-atch"));
         assert_eq!(names.session_var(), "SSH2INCUS_ATCH_SESSION");
         assert_eq!(names.dir_var(), "SSH2INCUS_ATCH_SESSION_DIR");
-        assert_eq!(names.progname, "/usr/local/bin/ssh2incus-atch");
-        assert_eq!(Names::new(OsStr::new("atch")).session_var(), "ATCH_SESSION");
+        assert_eq!(names.progname, "ssh2incus-atch");
+        assert_eq!(
+            Names::new(OsStr::new("ratch")).session_var(),
+            "RATCH_SESSION"
+        );
+        assert_eq!(Names::new(OsStr::new("ratch")).id_var(), "RATCH_SESSION_ID");
     }
 
     #[test]
@@ -614,7 +782,7 @@ mod tests {
         // Tests share a process, and another one may have the umask tightened.
         std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o700)).unwrap();
         let session =
-            Session::open(&Names::new(OsStr::new("atch")), deep.join("s").as_os_str()).unwrap();
+            Session::open(&Names::new(OsStr::new("ratch")), deep.join("s").as_os_str()).unwrap();
         let cwd = std::env::current_dir().unwrap();
         let (_listener, _) = session.bind().unwrap();
         assert!(matches!(session.probe(), Probe::Live(_)));
@@ -670,6 +838,70 @@ mod tests {
             leftovers.is_empty(),
             "temporary files left behind: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn renaming_moves_the_socket_and_its_files_together() {
+        let scratch = Scratch::new("rename");
+        let mut session = scratch.session("old");
+        let (_listener, id) = session.bind().unwrap();
+        session.replace_file(".log", b"history").unwrap();
+        session.rename(OsStr::new("new")).unwrap();
+        assert_eq!(session.name(), "new");
+        assert_eq!(session.sock_id(), Some(id));
+        assert!(matches!(session.probe(), Probe::Live(_)));
+        assert!(!scratch.0.join("old").exists() && !scratch.0.join("old.log").exists());
+        assert_eq!(
+            std::fs::read(scratch.0.join("new.log")).unwrap(),
+            b"history"
+        );
+
+        for bad in ["", ".hidden", "-flag", "a/b", "a:b", "tab\there"] {
+            assert!(session.rename(OsStr::new(bad)).is_err(), "{bad:?} accepted");
+        }
+        // Never over another session, running or remembered.
+        let other = scratch.session("taken");
+        let _other_listener = other.bind().unwrap();
+        assert!(session.rename(OsStr::new("taken")).is_err());
+        std::fs::write(scratch.0.join("past.log"), b"x").unwrap();
+        assert!(session.rename(OsStr::new("past")).is_err());
+        assert_eq!(session.name(), "new");
+    }
+
+    #[test]
+    fn environment_values_are_data_never_code() {
+        let nasty = "it's $(rm -rf ~) `id` \\ \"q\"\nline2";
+        let env = Env(vec![
+            ("SSH_AUTH_SOCK".into(), Some("/tmp/ssh-abc/agent.1".into())),
+            ("NASTY".into(), Some(nasty.into())),
+            ("DISPLAY".into(), None),
+        ]);
+        assert_eq!(
+            env.shell_commands(false),
+            "export SSH_AUTH_SOCK='/tmp/ssh-abc/agent.1'\n\
+             export NASTY='it'\\''s $(rm -rf ~) `id` \\ \"q\"\nline2'\n\
+             unset DISPLAY\n"
+        );
+        assert_eq!(
+            env.shell_commands(true),
+            "set -gx SSH_AUTH_SOCK '/tmp/ssh-abc/agent.1'\n\
+             set -gx NASTY 'it\\'s $(rm -rf ~) `id` \\\\ \"q\"\nline2'\n\
+             set -e DISPLAY\n"
+        );
+        // A real shell agrees that the value comes back unchanged.
+        let script = format!("{}printf %s \"$NASTY\"", env.shell_commands(false));
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), nasty);
+
+        let scratch = Scratch::new("env");
+        let session = scratch.session("s");
+        env.write(&session).unwrap();
+        assert_eq!(Env::read(&session), Some(env));
+        assert!(!is_variable_name("A B") && !is_variable_name("1X") && !is_variable_name("X;rm"));
     }
 
     #[test]

@@ -1,11 +1,6 @@
 /.*
 !.gitignore
 !.github
-*.o
-*~
-*.1
-*.1.md
-/atch
-build/
-release/
 /target
+*.deb
+*.pkg.tar.*

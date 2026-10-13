@@ -1,0 +1,177 @@
+.TH RATCH 1 "2026-10-13" "ratch 0.1.0" "User Commands"
+.SH NAME
+ratch \- detachable terminal sessions without terminal emulation
+.SH SYNOPSIS
+.B ratch
+.RI [ options ]
+.I session
+.RI [ command ...]
+.br
+.B ratch
+.RI [ options ]
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B ratch
+keeps a terminal program running after you detach from it and lets you attach
+again later, from the same terminal or another. It does not emulate a
+terminal: bytes from the program reach your terminal unchanged, and your keys
+reach the program unchanged.
+.PP
+With only a session name,
+.B ratch
+attaches to that session, first creating it if it is not running. Without a
+command a session runs the user's shell.
+.PP
+A session name containing a slash is taken as the path of the session's
+socket.
+.SH COMMANDS
+.TP
+.BI attach " session"
+Attach; fail if the session is not running.
+.TP
+.BI new " session " [ command ...]
+Create a session and attach.
+.TP
+.BI start " session " [ command ...]
+Create a session without attaching.
+.TP
+.BI run " session " [ command ...]
+Create a session and remain in the foreground as its master.
+.TP
+.BI push " session"
+Send standard input to the session as if typed.
+.TP
+.BR kill " [" \-f ] " \fIsession"
+Stop a session: SIGTERM, then SIGKILL after five seconds.
+.B \-f
+sends SIGKILL at once.
+.TP
+.BR wait " [" \-t " \fIseconds\fR] \fIsession"
+Wait for a session to end and exit with the program's status: its exit code,
+128 plus the signal number if a signal killed it, 124 if the time ran out,
+255 if the session ended without recording a status.
+.TP
+.BR log " [" \-f "] [" \-n " \fIN\fR] \fIsession"
+Print the session's output, or its last
+.I N
+lines.
+.B \-f
+keeps following a running session.
+.TP
+.BR tail " [" \-f "] [" \-n " \fIN\fR] \fIsession"
+The same, the last 10 lines by default.
+.TP
+.BR clear " [\fIsession\fR]"
+Forget the session's history. Without a name, the session the command is run
+in.
+.TP
+.BR list " [" \-a "] [" \-\-names ]
+List sessions.
+.B \-a
+includes finished ones;
+.B \-\-names
+prints names only.
+.TP
+.BI rm " session"
+.TQ
+.B rm \-a
+Remove the log and other files of a finished or dead session, or of all of
+them.
+.TP
+.BI rename " session new-name"
+Rename a running session.
+.TP
+.BR env " [" \-\-sh | \-\-fish "] [\fIsession\fR]"
+Print shell commands that set the terminal-related environment variables to
+those of the terminal that attached last. Use as
+.BR "eval \(dq$(ratch env)\(dq" .
+.TP
+.B current
+Print the session this shell is running in; with nested sessions, the chain.
+Exits 1 outside a session.
+.SH OPTIONS
+Options go before the command or after the session name.
+.TP
+.BI \-e " char"
+Detach character, given as a character or in caret notation. Default
+.BR ^\e .
+.TP
+.B \-E
+No detach character.
+.TP
+.BI \-n " lines"
+History to show on attach. Default: the last 128 kB. 0 shows none.
+.TP
+.B \-\-ro
+Attach read-only.
+.TP
+.BR \-R " " none | clear
+.B clear
+wipes the screen and its scrollback before attaching.
+.TP
+.BR \-r " " none | ctrl_l | winch
+How to ask the program to redraw after attaching. Default
+.BR winch .
+.TP
+.B \-H
+Keep the session open with a shell after the command ends.
+.TP
+.BI \-C " size"
+Log size limit, with an optional k or m suffix. 0 keeps no log. Default 1m.
+.TP
+.B \-z
+Do not interpret the suspend key.
+.TP
+.B \-q
+Suppress messages.
+.TP
+.B \-t
+Send the terminal no escape sequences.
+.SH ENVIRONMENT
+.TP
+.B RATCH_OPTS
+Options applied before those on the command line.
+.TP
+.B RATCH_SESSION_DIR
+Directory to keep sessions in.
+.TP
+.B RATCH_ENV_VARS
+Further variable names for
+.B env
+to carry, separated by spaces or commas.
+.TP
+.B RATCH_SESSION
+Set inside a session to its socket path; for nested sessions, the paths
+separated by colons, outermost first.
+.TP
+.B SHELL
+The program a session runs when no command is given.
+.PP
+The names follow the name the program is run under: a copy called
+.B foo
+uses
+.BR FOO_OPTS ,
+.B FOO_SESSION
+and so on.
+.SH FILES
+.TP
+.I ~/.cache/ratch/
+Sessions. Must belong to the user and have mode 0700. Each session has a
+socket named after it and, beside it,
+.I .log
+(output),
+.I .info
+(process ids, command, how it ended) and
+.I .env
+(environment of the terminal that attached last).
+.TP
+.I /tmp/.ratch\-UID/
+Used when there is no home directory.
+.SH SECURITY
+Any process running as the user can attach to, type into and stop the user's
+sessions. Nothing but the socket's permissions keeps other users out.
+.SH SEE ALSO
+.BR dtach (1),
+.BR screen (1),
+.BR tmux (1)

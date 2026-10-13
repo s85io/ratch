@@ -5,8 +5,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use atch::proto::{Attach, ClientMsg, Exit, Replay};
 use common::{contains, eventually, Ev, Home, Raw};
+use ratch::proto::{Attach, ClientMsg, Exit, Replay};
 
 const SOON: Duration = Duration::from_secs(10);
 
@@ -132,7 +132,7 @@ fn a_session_can_be_killed_while_input_is_backed_up() {
     std::thread::sleep(Duration::from_millis(500));
 
     let started = Instant::now();
-    let out = home.atch(&["kill", "s"]);
+    let out = home.ratch(&["kill", "s"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "kill failed: {text}");
     assert!(text.contains("stopped"), "{text}");
@@ -151,7 +151,7 @@ fn only_one_of_many_simultaneous_creators_wins() {
         let racers: Vec<_> = (0..24)
             .map(|_| {
                 scope.spawn(move || {
-                    let out = home.atch(&["start", "s", "sleep", "1000"]);
+                    let out = home.ratch(&["start", "s", "sleep", "1000"]);
                     String::from_utf8_lossy(&out.stdout).into_owned()
                 })
             })
@@ -165,7 +165,7 @@ fn only_one_of_many_simultaneous_creators_wins() {
         .count();
     assert_eq!((started, refused), (1, 23), "{results:?}");
     // And the one session is reachable under its name.
-    let out = home.atch(&["kill", "s"]);
+    let out = home.ratch(&["kill", "s"]);
     assert!(out.status.success());
 }
 
@@ -181,11 +181,11 @@ fn a_dead_masters_socket_is_replaced_not_obeyed() {
     assert!(eventually(SOON, || home.file("s.info").exists()));
     master.kill().unwrap();
     master.wait().unwrap();
-    let listing = String::from_utf8_lossy(&home.atch(&["list"]).stdout).into_owned();
+    let listing = String::from_utf8_lossy(&home.ratch(&["list"]).stdout).into_owned();
     assert!(listing.contains("[stale]"), "{listing}");
 
     home.start("s", "sleep 1000");
-    let listing = String::from_utf8_lossy(&home.atch(&["list"]).stdout).into_owned();
+    let listing = String::from_utf8_lossy(&home.ratch(&["list"]).stdout).into_owned();
     assert!(
         listing.contains('s') && !listing.contains("[stale]"),
         "{listing}"
@@ -195,7 +195,7 @@ fn a_dead_masters_socket_is_replaced_not_obeyed() {
 #[test]
 fn history_is_served_from_memory_even_without_a_log() {
     let home = Home::new("nolog");
-    let out = home.atch(&[
+    let out = home.ratch(&[
         "start",
         "-C",
         "0",
@@ -206,7 +206,7 @@ fn history_is_served_from_memory_even_without_a_log() {
     ]);
     assert!(out.status.success());
     assert!(eventually(SOON, || {
-        String::from_utf8_lossy(&home.atch(&["tail", "s"]).stdout).contains("remembered")
+        String::from_utf8_lossy(&home.ratch(&["tail", "s"]).stdout).contains("remembered")
     }));
     assert!(!home.file("s.log").exists());
 
@@ -224,7 +224,7 @@ fn cleared_history_does_not_come_back() {
     assert!(eventually(SOON, || {
         std::fs::read_to_string(home.file("s.log")).is_ok_and(|log| log.contains("secret-before"))
     }));
-    let out = home.atch(&["clear", "s"]);
+    let out = home.ratch(&["clear", "s"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("log cleared"));
     assert_eq!(std::fs::read(home.file("s.log")).unwrap(), b"");
 
@@ -311,7 +311,7 @@ fn garbage_on_the_socket_gets_an_error_not_a_crash() {
     let home = Home::new("garbage");
     home.start("s", "sleep 1000");
     assert!(eventually(SOON, || home.file("s").exists()));
-    // A packet of the old C protocol.
+    // Something that is not our protocol at all.
     let mut old = std::os::unix::net::UnixStream::connect(home.file("s")).unwrap();
     std::io::Write::write_all(&mut old, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
     let mut reply = Vec::new();
@@ -360,7 +360,7 @@ fn wait_returns_how_the_program_ended() {
     // An exit code, delivered to someone already waiting.
     home.start("code", "read x; exit 7");
     let waiter = std::thread::scope(|scope| {
-        let waiting = scope.spawn(|| home.atch(&["wait", "code"]));
+        let waiting = scope.spawn(|| home.ratch(&["wait", "code"]));
         std::thread::sleep(Duration::from_millis(300));
         Raw::connect(&home, "code").send(ClientMsg::Input(b"\n"));
         waiting.join().unwrap()
@@ -368,18 +368,18 @@ fn wait_returns_how_the_program_ended() {
     assert_eq!(waiter.status.code(), Some(7));
     // And to someone who asks after the fact.
     assert!(eventually(SOON, || !home.file("code").exists()));
-    assert_eq!(home.atch(&["wait", "code"]).status.code(), Some(7));
+    assert_eq!(home.ratch(&["wait", "code"]).status.code(), Some(7));
 
     // Still running when the patience runs out.
     home.start("slow", "sleep 1000");
-    let out = home.atch(&["wait", "-t", "0.3", "slow"]);
+    let out = home.ratch(&["wait", "-t", "0.3", "slow"]);
     assert_eq!(out.status.code(), Some(124), "{}", text(&out));
     // Killed by a signal: reported the way a shell would.
-    assert!(home.atch(&["kill", "-f", "slow"]).status.success());
-    assert_eq!(home.atch(&["wait", "slow"]).status.code(), Some(128 + 9));
+    assert!(home.ratch(&["kill", "-f", "slow"]).status.success());
+    assert_eq!(home.ratch(&["wait", "slow"]).status.code(), Some(128 + 9));
 
     // Never existed.
-    let out = home.atch(&["wait", "nobody"]);
+    let out = home.ratch(&["wait", "nobody"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out).contains("does not exist"));
 }
@@ -394,7 +394,7 @@ fn wait_admits_it_when_the_master_dies_without_a_word() {
         .unwrap();
     assert!(eventually(SOON, || home.file("s.info").exists()));
     let out = std::thread::scope(|scope| {
-        let waiting = scope.spawn(|| home.atch(&["wait", "s"]));
+        let waiting = scope.spawn(|| home.ratch(&["wait", "s"]));
         std::thread::sleep(Duration::from_millis(300));
         master.kill().unwrap();
         master.wait().unwrap();
@@ -410,22 +410,22 @@ fn log_shows_everything_and_tail_the_end_alive_or_dead() {
         "s",
         "i=1; while [ $i -le 30 ]; do printf 'line%02d\\n' $i; i=$((i+1)); done; sleep 1000",
     );
-    assert!(eventually(SOON, || text(&home.atch(&["log", "s"])).contains("line30")));
-    let all = text(&home.atch(&["log", "s"]));
+    assert!(eventually(SOON, || text(&home.ratch(&["log", "s"])).contains("line30")));
+    let all = text(&home.ratch(&["log", "s"]));
     assert!(all.contains("line01") && all.contains("line30"), "{all}");
-    let last = text(&home.atch(&["log", "-n", "3", "s"]));
+    let last = text(&home.ratch(&["log", "-n", "3", "s"]));
     assert!(
         last.contains("line28") && !last.contains("line27"),
         "{last}"
     );
-    let tail = text(&home.atch(&["tail", "s"]));
+    let tail = text(&home.ratch(&["tail", "s"]));
     assert!(
         tail.contains("line21") && !tail.contains("line20"),
         "{tail}"
     );
 
-    assert!(home.atch(&["kill", "-f", "s"]).status.success());
-    let after = text(&home.atch(&["log", "s"]));
+    assert!(home.ratch(&["kill", "-f", "s"]).status.success());
+    let after = text(&home.ratch(&["log", "s"]));
     assert!(
         after.contains("line01") && after.contains("ended after"),
         "{after}"
@@ -435,13 +435,13 @@ fn log_shows_everything_and_tail_the_end_alive_or_dead() {
 #[test]
 fn a_mistyped_command_does_not_become_a_session() {
     let home = Home::new("typo");
-    let out = home.atch(&["kil", "work"]);
+    let out = home.ratch(&["kil", "work"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out).contains("did you mean 'kill'"), "{}", text(&out));
-    assert_eq!(text(&home.atch(&["list", "-a"])).trim(), "(no sessions)");
+    assert_eq!(text(&home.ratch(&["list", "-a"])).trim(), "(no sessions)");
     // A session that really has such a name is still reachable by it.
     home.start("logs", "sleep 1000");
-    let out = home.atch(&["logs"]);
+    let out = home.ratch(&["logs"]);
     assert!(text(&out).contains("requires a terminal"), "{}", text(&out));
 }
 
@@ -453,7 +453,7 @@ fn a_session_is_not_killed_from_inside_by_accident() {
         "s",
         &format!(
             "{} kill s > {r} 2>&1; echo rc=$? >> {r}; sleep 1000",
-            common::ATCH,
+            common::RATCH,
             r = report.display()
         ),
     );
@@ -464,5 +464,101 @@ fn a_session_is_not_killed_from_inside_by_accident() {
         said.contains("from within itself") && said.contains("rc=1"),
         "{said}"
     );
-    assert!(text(&home.atch(&["list"])).contains('s'));
+    assert!(text(&home.ratch(&["list"])).contains('s'));
+}
+
+#[test]
+fn a_running_session_can_be_renamed() {
+    let home = Home::new("rename");
+    home.start("old", "echo under-old-name; sleep 1000");
+    assert!(eventually(SOON, || text(&home.ratch(&["log", "old"]))
+        .contains("under-old-name")));
+    let mut held = Raw::connect(&home, "old");
+    held.send(attach(Replay::None));
+
+    let out = home.ratch(&["rename", "old", "new"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("renamed to 'new'"));
+    let listing = text(&home.ratch(&["list", "--names"]));
+    assert_eq!(listing.trim(), "new");
+    // Its history came along, and a connection made before still works.
+    assert!(text(&home.ratch(&["log", "new"])).contains("under-old-name"));
+    held.send(ClientMsg::Clear);
+    let (_, ev) = held.collect(SOON, |ev, _| *ev == Ev::Ack);
+    assert_eq!(ev, Ev::Ack);
+
+    // Not onto another session, and not to something that is not a name.
+    home.start("other", "sleep 1000");
+    for bad in ["other", "a/b", ".hidden"] {
+        let out = home.ratch(&["rename", "new", bad]);
+        assert_eq!(out.status.code(), Some(1), "{bad}: {}", text(&out));
+        assert!(text(&out).contains("cannot rename"), "{}", text(&out));
+    }
+    // When it ends, it ends under its new name, leaving nothing of the old.
+    assert!(home.ratch(&["kill", "-f", "new"]).status.success());
+    assert!(eventually(SOON, || !home.file("new").exists()));
+    assert!(!home.file("old").exists() && !home.file("old.log").exists());
+    assert_eq!(home.ratch(&["wait", "new"]).status.code(), Some(128 + 9));
+}
+
+#[test]
+fn only_the_recent_history_is_shown_by_default() {
+    let home = Home::new("recent");
+    // About 600 kB of numbered lines, then a marker.
+    home.start("s", "seq 1 100000; echo THE-END; sleep 1000");
+    assert!(eventually(Duration::from_secs(30), || {
+        text(&home.ratch(&["tail", "-n", "1", "s"])).contains("THE-END")
+    }));
+    let mut client = Raw::connect(&home, "s");
+    client.send(attach(Replay::Default));
+    let (history, ev) = client.collect(SOON, |ev, _| *ev == Ev::ReplayEnd);
+    assert_eq!(ev, Ev::ReplayEnd);
+    assert!(
+        history.len() <= 128 * 1024 && history.len() > 100 * 1024,
+        "{} bytes",
+        history.len()
+    );
+    assert!(history.ends_with(b"THE-END\r\n"));
+    // It starts at the beginning of a line, not in the middle of one.
+    let first_line = history.split(|&b| b == b'\r').next().unwrap();
+    let n: u32 = String::from_utf8_lossy(first_line)
+        .parse()
+        .expect("a whole number");
+    assert!(history.starts_with(format!("{n}\r\n{}\r\n", n + 1).as_bytes()));
+}
+
+#[test]
+fn list_names_is_for_scripts() {
+    let home = Home::new("names");
+    assert_eq!(text(&home.ratch(&["list", "--names"])), "");
+    home.start("one", "sleep 1000");
+    home.start("two", "sleep 1000");
+    let mut names: Vec<String> = text(&home.ratch(&["list", "--names"]))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["one", "two"]);
+    // The full listing says what each one is running.
+    assert!(text(&home.ratch(&["list"])).contains("sleep 1000"));
+}
+
+#[test]
+fn log_of_a_full_screen_program_is_its_output_not_terminal_set_up() {
+    let home = Home::new("dump");
+    home.start(
+        "s",
+        "echo before-fullscreen; printf '\\033[?1049h\\033[?1000hINSIDE'; sleep 1000",
+    );
+    assert!(eventually(SOON, || text(&home.ratch(&["log", "s"])).contains("INSIDE")));
+    let log = text(&home.ratch(&["log", "s"]));
+    // History is there although the program is on the alternate screen now,
+    // and the only mode switches in it are the program's own, once each.
+    assert!(log.contains("before-fullscreen"), "{log:?}");
+    assert_eq!(log.matches("\x1b[?1049h").count(), 1, "{log:?}");
+    assert_eq!(log.matches("\x1b[?1000h").count(), 1, "{log:?}");
+    assert_eq!(
+        text(&home.ratch(&["tail", "-n", "1", "s"])),
+        "\x1b[?1049h\x1b[?1000hINSIDE"
+    );
 }

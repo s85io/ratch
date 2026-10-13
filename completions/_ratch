@@ -1,0 +1,61 @@
+#compdef ratch
+
+_ratch_sessions() {
+    local -a sessions
+    sessions=(${(f)"$(ratch list $1 --names 2>/dev/null)"})
+    _describe -t sessions 'session' sessions
+}
+
+_ratch() {
+    local -a commands options
+    commands=(
+        'attach:attach to a running session'
+        'new:create a session and attach'
+        'start:create a session, detached'
+        'run:create a session, master in the foreground'
+        'push:send stdin to a session as typed input'
+        'kill:stop a session'
+        'wait:wait for a session to end'
+        "log:print a session's output"
+        "tail:print the end of a session's output"
+        "clear:forget a session's history"
+        'list:list sessions'
+        'ls:list sessions'
+        'rm:remove what a finished session left behind'
+        'rename:rename a running session'
+        "env:print commands to refresh a shell's environment"
+        'current:print the session this shell is running in'
+    )
+    options=(
+        '-e[detach character]:character:'
+        '-E[no detach character]'
+        '-n[history to show on attach]:lines:'
+        '--ro[attach read-only]'
+        '-R[before attaching]:method:(none clear)'
+        '-r[redraw method]:method:(none ctrl_l winch)'
+        '-H[keep the session open after the command ends]'
+        '-C[log size limit]:size:'
+        '-z[do not interpret the suspend key]'
+        '-q[suppress messages]'
+        '-t[send the terminal no escape sequences]'
+    )
+
+    if (( CURRENT == 2 )); then
+        _alternative 'commands:command:(( ${commands} ))' 'sessions:session:_ratch_sessions'
+        return
+    fi
+    case $words[2] in
+        attach | push | kill | wait | clear | rename | env)
+            _arguments $options '*:session:_ratch_sessions' ;;
+        log | tail | rm)
+            _arguments '-f[follow]' '-n[lines]:lines:' '-a[all]' '*:session:_ratch_sessions -a' ;;
+        list | ls)
+            _arguments '-a[also finished sessions]' '--names[names only]' ;;
+        new | start | run)
+            _arguments $options '1:session:' '*::command:_normal' ;;
+        *)
+            _arguments $options '*::command:_normal' ;;
+    esac
+}
+
+_ratch "$@"

@@ -1,0 +1,31 @@
+pkgname=ratch
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Detachable terminal sessions without terminal emulation'
+arch=('x86_64' 'aarch64')
+url='https://github.com/s85io/ratch'
+license=('GPL-2.0-or-later')
+depends=('gcc-libs')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make install CARGO=true PREFIX=/usr DESTDIR="$pkgdir"
+}

@@ -149,6 +149,8 @@ struct Client {
     phase: Phase,
     greeted: bool,
     readonly: bool,
+    /// Wants the bytes only, with no terminal set-up around them.
+    dump: bool,
     /// Its input did not fit; not read again until the program catches up.
     paused: bool,
     /// The other side hung up; kept only until its last frames are handled.
@@ -169,6 +171,7 @@ impl Client {
             phase: Phase::Idle,
             greeted: false,
             readonly: false,
+            dump: false,
             paused: false,
             eof: false,
             closing: false,
@@ -222,11 +225,15 @@ impl Client {
         // Its terminal may be in the middle of a sequence we never finished:
         // CAN cancels one, ST ends a string, and both are harmless otherwise.
         let mut resume = b"\x18\x1b\\".to_vec();
-        self.send(ServerMsg::Output(&resume));
+        if !self.dump {
+            self.send(ServerMsg::Output(&resume));
+        }
         self.send(ServerMsg::Skipped);
-        resume.clear();
-        modes.restore(&mut resume);
-        self.send(ServerMsg::Output(&resume));
+        if !self.dump {
+            resume.clear();
+            modes.restore(&mut resume);
+            self.send(ServerMsg::Output(&resume));
+        }
         if matches!(self.phase, Phase::Replay { .. }) {
             self.send(ServerMsg::ReplayEnd);
         }
@@ -249,7 +256,9 @@ impl Client {
                 // the terminal into the program's modes, and go live.
                 let mut tail = Vec::new();
                 filter.finish(&mut tail);
-                modes.restore(&mut tail);
+                if !self.dump {
+                    modes.restore(&mut tail);
+                }
                 self.send(ServerMsg::Output(&tail));
                 self.send(ServerMsg::ReplayEnd);
                 self.phase = Phase::Live;
@@ -285,11 +294,12 @@ enum Cmd {
     Redraw(Redraw, u16, u16),
     Signal(u8),
     Clear,
+    Rename(std::ffi::OsString),
     Bad(String),
 }
 
 struct Master<'a> {
-    session: &'a Session,
+    session: Session,
     cfg: &'a Config,
     listener: UnixListener,
     sock_id: SockId,
@@ -386,7 +396,7 @@ fn session_env(names: &Names, session: &Session, id: u64) -> Vec<(OsString, OsSt
     };
     let var = names.session_var();
     vec![
-        chain(format!("{var}_ID"), format!("{id:016x}").into()),
+        chain(names.id_var(), format!("{id:016x}").into()),
         chain(var, session.sock.clone().into_os_string()),
     ]
 }
@@ -396,7 +406,7 @@ fn session_env(names: &Names, session: &Session, id: u64) -> Vec<(OsString, OsSt
 /// Setup failures are printed to stdout and return 1. Once the session is
 /// up, `ok` is printed, stdio is pointed at `/dev/null`, and the return value
 /// is the program's exit code.
-pub fn run(session: &Session, cfg: &Config) -> i32 {
+pub fn run(session: Session, cfg: &Config) -> i32 {
     let names = &cfg.names;
     // Ours is the terminal the session is created from; the program starts
     // with its settings. Look before we let go of it.
@@ -404,7 +414,7 @@ pub fn run(session: &Session, cfg: &Config) -> i32 {
     let size = sys::winsize_of(io::stdin());
     sys::new_session();
 
-    let (listener, sock_id, lock) = match claim(session, names) {
+    let (listener, sock_id, lock) = match claim(&session, names) {
         Ok(claimed) => claimed,
         Err(message) => {
             let _ = writeln!(io::stdout(), "{message}");
@@ -418,7 +428,7 @@ pub fn run(session: &Session, cfg: &Config) -> i32 {
         1
     };
 
-    let mut log = Log::open(session, cfg.log_cap);
+    let mut log = Log::open(&session, cfg.log_cap);
     let (pty, slave) = match sys::open_pty(termios.as_ref(), size) {
         Ok(pair) => pair,
         Err(e) => {
@@ -429,7 +439,7 @@ pub fn run(session: &Session, cfg: &Config) -> i32 {
             ))
         }
     };
-    let child = match sys::spawn_on_pty(slave, &cfg.argv, &session_env(names, session, id)) {
+    let child = match sys::spawn_on_pty(slave, &cfg.argv, &session_env(names, &session, id)) {
         Ok(child) => child,
         Err(e) => {
             return abandon(format!(
@@ -474,7 +484,7 @@ pub fn run(session: &Session, cfg: &Config) -> i32 {
             .join(" "),
         ..Info::default()
     };
-    let _ = info.write(session);
+    let _ = info.write(&session);
 
     // History from an earlier session of the same name is still history.
     let mut ring = Ring::new(RING_SIZE);
@@ -743,7 +753,7 @@ impl Master<'_> {
         }
 
         if let Some(log) = self.log.as_mut() {
-            if !log.append(self.session, data) {
+            if !log.append(&self.session, data) {
                 // A full disk costs the log, not the session.
                 self.log = None;
             }
@@ -816,6 +826,10 @@ impl Master<'_> {
                     Ok(ClientMsg::Redraw { method, rows, cols }) => Cmd::Redraw(method, rows, cols),
                     Ok(ClientMsg::Signal(sig)) => Cmd::Signal(sig),
                     Ok(ClientMsg::Clear) => Cmd::Clear,
+                    Ok(ClientMsg::Rename(name)) => {
+                        use std::os::unix::ffi::OsStrExt;
+                        Cmd::Rename(std::ffi::OsStr::from_bytes(name).to_owned())
+                    }
                 },
             };
             self.apply(i, cmd);
@@ -834,7 +848,7 @@ impl Master<'_> {
             }
             Cmd::Attach(attach) => {
                 let total = self.ring.total();
-                let start = if self.modes.alt_screen() {
+                let start = if self.modes.alt_screen() && !attach.dump {
                     // A full-screen program repaints; old output would only
                     // flash by underneath it.
                     total
@@ -854,6 +868,7 @@ impl Master<'_> {
                 };
                 let client = &mut self.clients[i];
                 client.readonly = attach.readonly;
+                client.dump = attach.dump;
                 client.pos = start;
                 client.phase = Phase::Replay {
                     end: total,
@@ -886,6 +901,19 @@ impl Master<'_> {
                     log.truncate();
                 }
                 self.clients[i].send(ServerMsg::Ack);
+            }
+            Cmd::Rename(name) => {
+                let renamed = match self.session.lock() {
+                    Ok(_lock) => self.session.rename(&name),
+                    Err(e) => Err(sys::describe(&e)),
+                };
+                match renamed {
+                    Ok(()) => {
+                        let _ = self.info.write(&self.session);
+                        self.clients[i].send(ServerMsg::Ack);
+                    }
+                    Err(why) => self.clients[i].send(ServerMsg::Error(&why)),
+                }
             }
             Cmd::Bad(why) => {
                 let client = &mut self.clients[i];
@@ -963,7 +991,7 @@ impl Master<'_> {
                 self.session.name(),
                 format_age(now.saturating_sub(self.info.started))
             );
-            log.append(self.session, marker.as_bytes());
+            log.append(&self.session, marker.as_bytes());
         }
         self.info.ended = Some(now);
         match exit {
@@ -971,7 +999,7 @@ impl Master<'_> {
             Some(Exit::Signal(sig)) => self.info.signal = Some(sig),
             None => {}
         }
-        let _ = self.info.write(self.session);
+        let _ = self.info.write(&self.session);
         if let Ok(_lock) = self.session.lock() {
             self.session.remove_socket(self.sock_id);
         }

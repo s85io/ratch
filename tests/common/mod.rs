@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use atch::proto::{ClientMsg, Decoder, Exit, ServerMsg, VERSION};
+use ratch::proto::{ClientMsg, Decoder, Exit, ServerMsg, VERSION};
 
-pub const ATCH: &str = env!("CARGO_BIN_EXE_atch");
+pub const RATCH: &str = env!("CARGO_BIN_EXE_ratch");
 
 /// A throwaway home directory. Sessions left running in it are killed on drop.
 pub struct Home(pub PathBuf);
@@ -18,21 +18,21 @@ pub struct Home(pub PathBuf);
 impl Home {
     pub fn new(tag: &str) -> Home {
         // Short on purpose: socket paths must fit in sun_path.
-        let path = PathBuf::from(format!("/tmp/atch-i{}-{tag}", std::process::id()));
+        let path = PathBuf::from(format!("/tmp/ratch-i{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         Home(path)
     }
 
     pub fn command(&self) -> Command {
-        let mut cmd = Command::new(ATCH);
+        let mut cmd = Command::new(RATCH);
         cmd.env("HOME", &self.0)
-            .env_remove("ATCH_SESSION")
-            .env_remove("ATCH_SESSION_ID");
+            .env_remove("RATCH_SESSION")
+            .env_remove("RATCH_SESSION_ID");
         cmd
     }
 
-    pub fn atch(&self, args: &[&str]) -> Output {
+    pub fn ratch(&self, args: &[&str]) -> Output {
         self.command()
             .args(args)
             .stdin(Stdio::null())
@@ -42,7 +42,7 @@ impl Home {
 
     /// Start a detached session running `sh -c script`.
     pub fn start(&self, name: &str, script: &str) {
-        let out = self.atch(&["start", name, "sh", "-c", script]);
+        let out = self.ratch(&["start", name, "sh", "-c", script]);
         assert!(
             out.status.success(),
             "start failed: {}",
@@ -51,7 +51,7 @@ impl Home {
     }
 
     pub fn dir(&self) -> PathBuf {
-        self.0.join(".cache/atch")
+        self.0.join(".cache/ratch")
     }
 
     pub fn file(&self, name: &str) -> PathBuf {

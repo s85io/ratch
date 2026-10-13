@@ -1,72 +1,38 @@
-VERSION ?= dev
-CC = gcc
-CFLAGS = -g -O2 -W -Wall -I. -DPACKAGE_VERSION=\"$(VERSION)\"
-LDFLAGS =
-LIBS = -lutil
+PREFIX ?= /usr/local
+DESTDIR ?=
+CARGO ?= cargo
+BIN = target/release/ratch
 
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-  STATIC_FLAG =
-else
-  STATIC_FLAG = -static
-endif
+.PHONY: all build check install uninstall clean
 
-OBJ = attach.o master.o atch.o
-SRC = attach.c master.c atch.c
+all: build
 
-IMAGE = atch-builder
-BUILDDIR ?= .
+build:
+	$(CARGO) build --release
 
-archs = amd64 arm64
-arch ?= $(shell arch)
+check: build
+	$(CARGO) fmt --check
+	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) test
+	sh tests/test.sh "$(CURDIR)/$(BIN)"
 
-atch: $(OBJ)
-	$(CC) -o $(BUILDDIR)/$@ $(STATIC_FLAG) $(LDFLAGS) $(OBJ) $(LIBS)
+install: build
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/man/man1
+	install -m 755 $(BIN) $(DESTDIR)$(PREFIX)/bin/ratch
+	install -m 644 ratch.1 $(DESTDIR)$(PREFIX)/share/man/man1/ratch.1
+	install -d $(DESTDIR)$(PREFIX)/share/bash-completion/completions
+	install -m 644 completions/ratch.bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/ratch
+	install -d $(DESTDIR)$(PREFIX)/share/zsh/site-functions
+	install -m 644 completions/_ratch $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_ratch
+	install -d $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d
+	install -m 644 completions/ratch.fish $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/ratch.fish
 
-atch.1.md: README.md scripts/readme2man.sh
-	bash scripts/readme2man.sh $< > $@
-
-atch.1: atch.1.md
-	pandoc --standalone -t man $< -o $@
-
-man: atch.1
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/ratch \
+	      $(DESTDIR)$(PREFIX)/share/man/man1/ratch.1 \
+	      $(DESTDIR)$(PREFIX)/share/bash-completion/completions/ratch \
+	      $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_ratch \
+	      $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/ratch.fish
 
 clean:
-	rm -f atch $(OBJ) *.1.md *.c~
-
-.PHONY: fmt
-fmt:
-	docker run --rm -v "$$PWD":/src -w /src alpine:latest sh -c "apk add --no-cache indent && indent -linux $(SRCS) && indent -linux $(SRCS)"
-
-.PHONY: fmt-all
-fmt-all:
-	$(MAKE) fmt SRCS="*.c"
-
-
-attach.o: ./attach.c ./atch.h config.h
-master.o: ./master.c ./atch.h config.h
-atch.o: ./atch.c ./atch.h config.h
-
-.PHONY: build-image
-build-image:
-	docker build -t $(IMAGE):$(arch) --platform linux/$(arch) -f build.dockerfile .
-
-build-docker: build-image
-	$(MAKE) clean
-	docker run --rm -v "$$PWD":/src -e VERSION=$(VERSION) -w /src \
-		--platform linux/$(arch) $(IMAGE):$(arch) ./build.sh
-
-.PHONY: test
-test: build-docker
-	docker run --rm -v "$$PWD":/src \
-		--platform linux/$(arch) $(IMAGE):$(arch) \
-		sh /src/tests/test.sh /src/build/atch
-
-.PHONY: release
-release: man $(archs)
-
-$(archs):
-	mkdir -p release
-	$(MAKE) build-docker arch=$@ VERSION=$(VERSION)
-	export COPYFILE_DISABLE=true; \
-	tar -czf ./release/atch-linux-$@.tgz README.md atch.1 -C ./build atch; \
+	$(CARGO) clean

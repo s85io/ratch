@@ -1,18 +1,18 @@
 [package]
-name = "atch"
-version = "0.9.0-dev"
+name = "ratch"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Attach and detach terminal sessions"
+description = "Detachable terminal sessions without terminal emulation"
 license = "GPL-2.0-or-later"
-repository = "https://github.com/s85io/atch"
+repository = "https://github.com/s85io/ratch"
 
 [lib]
-name = "atch"
+name = "ratch"
 path = "src/lib.rs"
 
 [[bin]]
-name = "atch"
+name = "ratch"
 path = "src/main.rs"
 
 [dependencies]

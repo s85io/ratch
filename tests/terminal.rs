@@ -8,13 +8,13 @@ use std::os::fd::OwnedFd;
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
-use atch::sys::{self, PollFd, PollFlags, Winsize};
-use common::{contains, eventually, Home, ATCH};
+use common::{contains, eventually, Home, RATCH};
+use ratch::sys::{self, PollFd, PollFlags, Winsize};
 
 const SOON: Duration = Duration::from_secs(10);
 const DETACH: &[u8] = b"\x1c";
 
-/// `atch` running on a pty of its own, with us as the terminal.
+/// `ratch` running on a pty of its own, with us as the terminal.
 struct Term {
     master: OwnedFd,
     child: Child,
@@ -30,13 +30,13 @@ impl Term {
             ws_ypixel: 0,
         };
         let (master, slave) = sys::open_pty(None, Some(size)).unwrap();
-        let mut argv = vec![OsString::from(ATCH)];
+        let mut argv = vec![OsString::from(RATCH)];
         argv.extend(args.iter().map(OsString::from));
         let env = [
             ("HOME".into(), home.0.clone().into_os_string()),
             // Empty counts as unset: the test itself may run inside a session.
-            ("ATCH_SESSION".into(), OsString::new()),
-            ("ATCH_SESSION_ID".into(), OsString::new()),
+            ("RATCH_SESSION".into(), OsString::new()),
+            ("RATCH_SESSION_ID".into(), OsString::new()),
         ];
         let child = sys::spawn_on_pty(slave, &argv, &env).unwrap();
         Term {
@@ -132,7 +132,7 @@ fn detaching_gives_the_terminal_back_and_attaching_sets_it_up_again() {
     let mut term = Term::spawn(&home, &["new", "s", "sh", "-c", fullscreen]);
     term.expect("READY");
     assert!(eventually(SOON, || {
-        String::from_utf8_lossy(&home.atch(&["list"]).stdout).contains("[attached]")
+        String::from_utf8_lossy(&home.ratch(&["list"]).stdout).contains("[attached]")
     }));
     term.mark();
     term.send(DETACH);
@@ -155,7 +155,7 @@ fn detaching_gives_the_terminal_back_and_attaching_sets_it_up_again() {
     // The alternate screen is left before the message, or it would vanish.
     assert!(seen.find("\x1b[?1049l") < seen.find("detached"), "{seen:?}");
     assert!(eventually(SOON, || {
-        !String::from_utf8_lossy(&home.atch(&["list"]).stdout).contains("[attached]")
+        !String::from_utf8_lossy(&home.ratch(&["list"]).stdout).contains("[attached]")
     }));
 
     // A different terminal attaches: it must be put in the program's modes.
@@ -224,7 +224,7 @@ fn resizing_the_terminal_resizes_the_program() {
 #[test]
 fn a_session_cannot_be_attached_from_inside_itself() {
     let home = Home::new("inside");
-    let inner = format!("{ATCH} attach s; echo inner-status-$?; sleep 1000");
+    let inner = format!("{RATCH} attach s; echo inner-status-$?; sleep 1000");
     let mut term = Term::spawn(&home, &["new", "s", "sh", "-c", &inner]);
     term.expect("cannot attach to session 's' from within itself");
     term.expect("inner-status-1");
@@ -262,60 +262,6 @@ fn the_detach_key_can_be_changed_or_turned_off() {
     assert!(seen.contains("detached"), "{seen:?}");
 }
 
-/// A session started by the C implementation must stay usable after the
-/// binary is upgraded. Runs when `ATCH_C_REFERENCE` points at a C build.
-#[test]
-fn a_session_held_by_a_c_master_can_be_attached_pushed_and_killed() {
-    let Some(c_atch) = std::env::var_os("ATCH_C_REFERENCE") else {
-        eprintln!("skipped: set ATCH_C_REFERENCE to a C build of atch");
-        return;
-    };
-    let home = Home::new("cmaster");
-    // The C binary must be invoked as `atch` to share the session directory.
-    let bin = home.0.join("atch");
-    std::fs::copy(&c_atch, &bin).unwrap();
-    let started = std::process::Command::new(&bin)
-        .args(["start", "s", "cat"])
-        .env("HOME", &home.0)
-        .env_remove("ATCH_SESSION")
-        .output()
-        .unwrap();
-    assert!(
-        started.status.success(),
-        "{}",
-        String::from_utf8_lossy(&started.stdout)
-    );
-
-    let mut push = home
-        .command()
-        .args(["push", "s"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::io::Write::write_all(push.stdin.as_mut().unwrap(), b"pushed-by-rust\n").unwrap();
-    drop(push.stdin.take());
-    assert!(push.wait().unwrap().success());
-    assert!(eventually(SOON, || {
-        std::fs::read(home.file("s.log")).is_ok_and(|log| contains(&log, b"pushed-by-rust"))
-    }));
-
-    let mut term = Term::spawn(&home, &["attach", "s"]);
-    term.expect("pushed-by-rust");
-    term.send(b"typed-by-rust\r");
-    term.expect("typed-by-rust");
-    term.send(DETACH);
-    let (seen, status) = term.finish();
-    assert!(seen.contains("detached"), "{seen:?}");
-    assert!(status.success());
-
-    let out = home.atch(&["kill", "s"]);
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(
-        out.status.success() && (text.contains("stopped") || text.contains("killed")),
-        "{text}"
-    );
-}
-
 #[test]
 fn a_read_only_attach_watches_and_cannot_type() {
     let home = Home::new("readonly");
@@ -324,13 +270,13 @@ fn a_read_only_attach_watches_and_cannot_type() {
     assert!(eventually(SOON, || home.file("s").exists()));
     term.send(b"typed-by-the-watcher\r");
     let mut other = common::Raw::connect(&home, "s");
-    other.send(atch::proto::ClientMsg::Input(b"typed-by-someone-else\n"));
+    other.send(ratch::proto::ClientMsg::Input(b"typed-by-someone-else\n"));
     term.expect("typed-by-someone-else");
     // Our own pty may echo what we typed; what counts is what the program got.
     let log = std::fs::read(home.file("s.log")).unwrap();
     assert!(contains(&log, b"typed-by-someone-else") && !contains(&log, b"typed-by-the-watcher"));
     // A watcher does not count as someone being attached.
-    assert!(!String::from_utf8_lossy(&home.atch(&["list"]).stdout).contains("[attached]"));
+    assert!(!String::from_utf8_lossy(&home.ratch(&["list"]).stdout).contains("[attached]"));
     term.send(DETACH);
     let (seen, _) = term.finish();
     assert!(seen.contains("detached"), "{seen:?}");
@@ -357,4 +303,127 @@ fn the_amount_of_history_shown_on_attach_can_be_chosen() {
     term.send(DETACH);
     let (seen, _) = term.finish();
     assert!(!seen.contains("line50"), "{seen:?}");
+}
+
+#[test]
+fn a_held_session_outlives_its_command() {
+    let home = Home::new("hold");
+    let mut term = Term::spawn(
+        &home,
+        &["new", "-H", "s", "sh", "-c", "echo did-the-work; exit 3"],
+    );
+    term.expect("did-the-work");
+    term.expect("command exited with status 3");
+    // A shell is there now; the session is still running.
+    assert!(String::from_utf8_lossy(&home.ratch(&["list"]).stdout).contains("s "));
+    term.send(DETACH);
+    let (seen, _) = term.finish();
+    assert!(seen.contains("detached"), "{seen:?}");
+}
+
+#[test]
+fn the_screen_can_be_wiped_before_attaching() {
+    let home = Home::new("wipe");
+    home.start("s", "echo hello; sleep 1000");
+    let mut term = Term::spawn(&home, &["attach", "-R", "clear", "s"]);
+    term.expect("hello");
+    let seen = String::from_utf8_lossy(&term.seen).into_owned();
+    assert!(
+        seen.find("\x1b[H\x1b[2J\x1b[3J") < seen.find("hello"),
+        "{seen:?}"
+    );
+    term.send(DETACH);
+    term.finish();
+}
+
+#[test]
+fn options_can_come_from_the_environment() {
+    let home = Home::new("envopts");
+    home.start("s", "echo READY; cat");
+    let size = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let (master, slave) = sys::open_pty(None, Some(size)).unwrap();
+    let argv: Vec<OsString> = [RATCH, "attach", "s"].iter().map(OsString::from).collect();
+    let env = [
+        ("HOME".into(), home.0.clone().into_os_string()),
+        ("RATCH_SESSION".into(), OsString::new()),
+        ("RATCH_SESSION_ID".into(), OsString::new()),
+        ("RATCH_OPTS".into(), OsString::from("-e ^A -q")),
+    ];
+    let child = sys::spawn_on_pty(slave, &argv, &env).unwrap();
+    let mut term = Term {
+        master,
+        child,
+        seen: Vec::new(),
+    };
+    term.expect("READY");
+    term.send(b"\x01");
+    let (seen, status) = term.finish();
+    // Detached by the key from the environment, and quietly? No: the parting
+    // message is always shown; -q silences only notices like "created".
+    assert!(seen.contains("detached"), "{seen:?}");
+    assert!(status.success());
+}
+
+#[test]
+fn attaching_records_the_terminals_environment_for_env() {
+    let home = Home::new("envcmd");
+    home.start("s", "sleep 1000");
+    let out = home.ratch(&["env", "s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "nothing recorded before anyone attached"
+    );
+
+    let size = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let (master, slave) = sys::open_pty(None, Some(size)).unwrap();
+    let argv: Vec<OsString> = [RATCH, "attach", "s"].iter().map(OsString::from).collect();
+    let env = [
+        ("HOME".into(), home.0.clone().into_os_string()),
+        ("RATCH_SESSION".into(), OsString::new()),
+        ("RATCH_SESSION_ID".into(), OsString::new()),
+        (
+            "SSH_AUTH_SOCK".into(),
+            OsString::from("/tmp/it's an agent.sock"),
+        ),
+        ("TERM".into(), OsString::from("xterm-test")),
+        ("RATCH_ENV_VARS".into(), OsString::from("MY_VAR, 9bad")),
+        ("MY_VAR".into(), OsString::from("mine")),
+    ];
+    let child = sys::spawn_on_pty(slave, &argv, &env).unwrap();
+    let mut term = Term {
+        master,
+        child,
+        seen: Vec::new(),
+    };
+    assert!(eventually(SOON, || home.file("s.env").exists()));
+    term.send(DETACH);
+    term.finish();
+
+    let sh = String::from_utf8_lossy(&home.ratch(&["env", "--sh", "s"]).stdout).into_owned();
+    assert!(sh.contains("export TERM='xterm-test'\n"), "{sh}");
+    assert!(
+        sh.contains("export SSH_AUTH_SOCK='/tmp/it'\\''s an agent.sock'\n"),
+        "{sh}"
+    );
+    assert!(
+        sh.contains("export MY_VAR='mine'\n") && !sh.contains("9bad"),
+        "{sh}"
+    );
+    let fish = String::from_utf8_lossy(&home.ratch(&["env", "--fish", "s"]).stdout).into_owned();
+    assert!(fish.contains("set -gx TERM 'xterm-test'\n"), "{fish}");
+    assert!(
+        fish.contains("set -gx SSH_AUTH_SOCK '/tmp/it\\'s an agent.sock'\n"),
+        "{fish}"
+    );
 }

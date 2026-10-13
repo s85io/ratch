@@ -1,4 +1,4 @@
-//! atch - attach and detach terminal sessions.
+//! ratch - detachable terminal sessions without terminal emulation.
 //!
 //! Layers, top to bottom; a module may only use the ones below it:
 //!
