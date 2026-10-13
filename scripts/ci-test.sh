@@ -6,7 +6,8 @@
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
-cargo test "$@" >"$log" 2>&1
+# Run every test binary even after one fails: a run should say all it can.
+cargo test --no-fail-fast "$@" >"$log" 2>&1
 status=$?
 cat "$log"
 

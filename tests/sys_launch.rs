@@ -60,7 +60,7 @@ fn read_until(master: &OwnedFd, done: impl Fn(&str) -> bool) -> (String, &'stati
 #[test]
 fn child_gets_a_controlling_terminal() {
     let (master, slave) = sys::open_pty(None, None).unwrap();
-    let mut child = sys::spawn_on_pty(slave, &sh("exec 3</dev/tty && echo CTTY_OK"), &[]).unwrap();
+    let mut child = sys::spawn_on_pty(slave, &sh("if ( : </dev/tty ) 2>/dev/null; then echo CTTY_OK; else echo CTTY_MISSING; fi"), &[]).unwrap();
     let (out, how) = read_until(&master, |s| s.contains("CTTY_OK"));
     assert_eq!(how, "matched", "output: {out:?}");
     assert!(child.wait().unwrap().success());
