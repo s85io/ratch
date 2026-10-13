@@ -76,3 +76,18 @@ Messages and exit codes of all of the above are pinned by `tests/test.sh`.
    128 KB by default. C has the client read the whole log from disk.
 7. **A C client cannot talk to a Rust master.** A Rust client can attach to,
    push to and kill a session held by a C master.
+8. **Creating a session over a dead socket just works.** C refuses with
+   "already running" unless the default attach-or-create form is used.
+9. **Typing during history replay is kept.** Only what a terminal sends on
+   its own, in reply to a query found in the history, is dropped.
+10. **Detaching leaves the terminal as it was found**: the modes the program
+    switched on (alternate screen, mouse, bracketed paste, keyboard protocol)
+    are undone before the parting message. C resets colours and the cursor only.
+11. **The master closes descriptors it inherits**, other than the standard
+    three. A program started with `start` or `new` no longer sees files the
+    invoking shell had open; `run` passes them on as before.
+12. **`-q` silences `kill` too.** C prints "stopped" regardless.
+13. **No blank line is printed on attach**; `-R move` clears the screen and
+    its scrollback instead of resetting the terminal.
+14. **Without `$HOME` or `$SHELL`**, the fallback is the caller's line in
+    `/etc/passwd`, where C asks the system's user database.

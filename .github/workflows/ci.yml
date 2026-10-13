@@ -25,12 +25,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test
-      # The C implementation stays the reference until the Rust one reaches parity.
+      # The C implementation stays the reference until the Rust one has
+      # passed everything here on every system.
       - name: C reference build and suite
         run: |
           make CC=cc
-          sh tests/test.sh ./atch
+          sh tests/test.sh "$PWD/atch"
+          cp atch /tmp/atch-c-reference
+      - name: Unit and integration tests
+        run: ATCH_C_REFERENCE=/tmp/atch-c-reference cargo test
+      - name: Black-box suite against the Rust binary
+        run: |
+          cargo build --release
+          sh tests/test.sh "$PWD/target/release/atch"
 
   musl:
     runs-on: ubuntu-latest

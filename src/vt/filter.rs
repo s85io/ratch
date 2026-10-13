@@ -65,20 +65,57 @@ pub fn is_query(token: &Token<'_>) -> bool {
     }
 }
 
-#[derive(Debug, Default)]
+/// Is this something a terminal sends on its own, in reply to a query?
+///
+/// Used on keyboard input while history is being played: an answer to a
+/// query the filter above did not know must not reach the program as typing,
+/// while real typing must. Nobody types a control string, and the reports
+/// have final bytes no key produces.
+pub fn is_reply(token: &Token<'_>) -> bool {
+    match *token {
+        Token::Str { .. } => true,
+        Token::Csi(csi) => match (csi.private, csi.inter, csi.fin) {
+            // Device attributes and status reports.
+            (b'?' | b'>' | b'=', 0, b'c') | (0 | b'?', 0, b'n') => true,
+            // Cursor position; with a single parameter it is the F3 key.
+            (0 | b'?', 0, b'R') => csi.params().count() >= 2,
+            // Mode, keyboard flag and window reports.
+            (_, b'$', b'y') | (b'?', 0, b'u') | (0, 0, b't') => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Passes a stream through, minus the tokens a predicate picks out.
+#[derive(Debug)]
 pub struct Filter {
     parser: Parser,
+    drop: fn(&Token<'_>) -> bool,
 }
 
 impl Filter {
-    pub fn new() -> Filter {
-        Filter::default()
+    /// For program output being replayed: drops what a terminal would answer.
+    pub fn queries() -> Filter {
+        Filter {
+            parser: Parser::new(),
+            drop: is_query,
+        }
     }
 
-    /// Append `input`, minus queries, to `out`.
+    /// For keyboard input during replay: drops what a terminal answered.
+    pub fn replies() -> Filter {
+        Filter {
+            parser: Parser::new(),
+            drop: is_reply,
+        }
+    }
+
+    /// Append `input`, minus the dropped tokens, to `out`.
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        let drop = self.drop;
         self.parser.feed(input, |token| {
-            if !is_query(&token) {
+            if !drop(&token) {
                 out.extend_from_slice(token.raw());
             }
         });
@@ -99,7 +136,7 @@ mod tests {
 
     fn filter(input: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut filter = Filter::new();
+        let mut filter = Filter::queries();
         filter.feed(input, &mut out);
         filter.finish(&mut out);
         out
@@ -183,7 +220,7 @@ mod tests {
         assert!(whole.len() < SAMPLE.len());
         for cut in 1..SAMPLE.len() {
             let mut out = Vec::new();
-            let mut filter = Filter::new();
+            let mut filter = Filter::queries();
             filter.feed(&SAMPLE[..cut], &mut out);
             filter.feed(&SAMPLE[cut..], &mut out);
             filter.finish(&mut out);
@@ -192,9 +229,57 @@ mod tests {
     }
 
     #[test]
+    fn replies_are_dropped_from_input_and_typing_is_not() {
+        let through = |input: &[u8]| {
+            let mut out = Vec::new();
+            let mut filter = Filter::replies();
+            filter.feed(input, &mut out);
+            filter.finish(&mut out);
+            out
+        };
+        let replies: &[&[u8]] = &[
+            b"\x1b[?62;22c",
+            b"\x1b[>0;10;1c",
+            b"\x1b[0n",
+            b"\x1b[24;80R",
+            b"\x1b[?2026;2$y",
+            b"\x1b[?1u",
+            b"\x1b[8;24;80t",
+            b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\",
+            b"\x1b]11;rgb:0c0c/0c0c/0c0c\x07",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1bP>|xterm(390)\x1b\\",
+        ];
+        for reply in replies {
+            assert_eq!(through(reply), b"", "{:?}", String::from_utf8_lossy(reply));
+        }
+        let typing: &[&[u8]] = &[
+            b"ls -la\r",
+            b"\x1b[A\x1b[B\x1b[C\x1b[D",
+            b"\x1b[1;5C\x1b[3~\x1b[H\x1b[F",
+            b"\x1bOP\x1bOQ\x1b[R\x1b[15~",
+            b"\x1bb\x1bf\x1b\x7f",
+            b"\x03\x04\x1a\x1c",
+            b"\x1b[200~pasted text\x1b[201~",
+            b"\x1b[97;5u",
+            b"\x1b[<0;10;20M\x1b[<0;10;20m",
+            b"\x1b[I\x1b[O",
+            "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}".as_bytes(),
+        ];
+        for keys in typing {
+            assert_eq!(through(keys), *keys, "{:?}", String::from_utf8_lossy(keys));
+        }
+        // The garbage from the bug report: every piece of it is a reply.
+        assert_eq!(
+            through(b"\x1b[2;2R\x1b[>0;10;1c\x1b]10;rgb:cccc/cccc/cccc\x07\x1b[?12;2$y"),
+            b""
+        );
+    }
+
+    #[test]
     fn stopping_mid_sequence_releases_it() {
         let mut out = Vec::new();
-        let mut filter = Filter::new();
+        let mut filter = Filter::queries();
         filter.feed(b"abc\x1b[?10", &mut out);
         assert_eq!(out, b"abc");
         filter.finish(&mut out);

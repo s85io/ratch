@@ -9,7 +9,11 @@
 //! 0. `sys`              the operating system; the only place `unsafe` is allowed
 #![deny(unsafe_code)]
 
+pub mod cli;
+pub mod client;
+pub mod master;
 pub mod proto;
 pub mod ring;
+pub mod session;
 pub mod sys;
 pub mod vt;

@@ -107,9 +107,6 @@ pub enum ClientMsg<'a> {
     Signal(u8),
     /// Forget the history, in memory and on disk.
     Clear,
-    /// Tell me how the session ends.
-    Wait,
-    Rename(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,8 +134,6 @@ mod kind {
     pub const REDRAW: u8 = 6;
     pub const SIGNAL: u8 = 7;
     pub const CLEAR: u8 = 8;
-    pub const WAIT: u8 = 9;
-    pub const RENAME: u8 = 10;
 
     pub const HELLO_ACK: u8 = 0x81;
     pub const OUTPUT: u8 = 0x82;
@@ -217,8 +212,6 @@ impl ClientMsg<'_> {
             }
             ClientMsg::Signal(sig) => frame(out, kind::SIGNAL, 0, &[sig]),
             ClientMsg::Clear => frame(out, kind::CLEAR, 0, &[]),
-            ClientMsg::Wait => frame(out, kind::WAIT, 0, &[]),
-            ClientMsg::Rename(name) => frame(out, kind::RENAME, 0, name),
         }
     }
 
@@ -253,9 +246,7 @@ impl ClientMsg<'_> {
             },
             (kind::SIGNAL, 1) => ClientMsg::Signal(p[0]),
             (kind::CLEAR, 0) => ClientMsg::Clear,
-            (kind::WAIT, 0) => ClientMsg::Wait,
-            (kind::RENAME, 1..) => ClientMsg::Rename(p),
-            (kind::HELLO..=kind::RENAME, _) => return Err(bad),
+            (kind::HELLO..=kind::CLEAR, _) => return Err(bad),
             (other, _) => return Err(ProtoError::UnknownType(other)),
         })
     }
@@ -396,8 +387,6 @@ mod tests {
             },
             ClientMsg::Signal(15),
             ClientMsg::Clear,
-            ClientMsg::Wait,
-            ClientMsg::Rename(b"new-name"),
         ]
     }
 
@@ -514,8 +503,8 @@ mod tests {
                 ProtoError::Malformed(kind::REDRAW),
             ),
             (
-                &[kind::RENAME, 0, 0, 0],
-                ProtoError::Malformed(kind::RENAME),
+                &[kind::DETACH, 0, 1, 0, 7],
+                ProtoError::Malformed(kind::DETACH),
             ),
         ];
         for (bytes, expected) in cases {
