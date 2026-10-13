@@ -1,5 +1,6 @@
 /.*
 !.gitignore
+!.github
 *.o
 *~
 *.1
@@ -7,3 +8,4 @@
 /atch
 build/
 release/
+/target

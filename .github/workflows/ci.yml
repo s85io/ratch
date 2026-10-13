@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+      # The C implementation stays the reference until the Rust one reaches parity.
+      - name: C reference build and suite
+        run: |
+          make CC=cc
+          sh tests/test.sh ./atch
+
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo test --target x86_64-unknown-linux-musl
+      - name: Binary size
+        run: |
+          size=$(stat -c %s target/x86_64-unknown-linux-musl/release/atch)
+          echo "static binary: $size bytes"
+          test "$size" -le 1048576
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: cargo test
