@@ -20,10 +20,16 @@ fn attach(replay: Replay) -> ClientMsg<'static> {
 }
 
 fn counter(home: &Home) -> u64 {
-    std::fs::read_to_string(home.0.join("tick"))
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
-        .unwrap_or(0)
+    // The program rewrites the file each time round; a read that lands
+    // between its truncation and its write sees nothing. Look again.
+    for _ in 0..50 {
+        let read = std::fs::read_to_string(home.0.join("tick")).ok();
+        if let Some(n) = read.and_then(|t| t.trim().parse().ok()) {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    0
 }
 
 /// The defect that started this: with the C master, a client that stopped
