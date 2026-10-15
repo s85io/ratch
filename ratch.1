@@ -1,4 +1,4 @@
-.TH RATCH 1 "2026-10-13" "ratch 0.1.0" "User Commands"
+.TH RATCH 1 "2026-10-15" "ratch 0.2.0" "User Commands"
 .SH NAME
 ratch \- detachable terminal sessions without terminal emulation
 .SH SYNOPSIS
@@ -112,7 +112,12 @@ wipes the screen and its scrollback before attaching.
 .TP
 .BR \-r " " none | ctrl_l | winch
 How to ask the program to redraw after attaching. Default
-.BR winch .
+.BR winch :
+the window size is set, and when it is the same as before, it is made one
+column narrower for a moment first, since many programs repaint only for a
+size that really changed.
+While the program repaints, a terminal that knows synchronized output holds
+its picture still, then shows the result at once.
 .TP
 .B \-H
 Keep the session open with a shell after the command ends.

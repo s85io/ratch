@@ -1,5 +1,5 @@
 pkgname=ratch
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Detachable terminal sessions without terminal emulation'
 arch=('x86_64' 'aarch64')
@@ -7,6 +7,8 @@ url='https://github.com/s85io/ratch'
 license=('GPL-2.0-or-later')
 depends=('gcc-libs')
 makedepends=('cargo')
+provides=('ratch')
+conflicts=('ratch-git')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

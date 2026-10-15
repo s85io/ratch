@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.0
+
+For programs such as Claude Code and omp:
+
+- Attaching at the size the session already has now gets the program to
+  repaint. Programs on Node or Bun ignore a window change that keeps the
+  size, so the screen stayed blank until the window was resized; the window
+  is now made a column narrower for a moment, then put back.
+- A read-only attach gets the program to repaint too, at the size it has.
+- The program is asked to repaint even in a session created without a
+  terminal (`start` from a script).
+- The window's size in pixels reaches the program, for those that draw
+  images.
+- The reports a terminal sends unasked (window size, colour scheme, kitty
+  paste events: modes 2048, 2031, 5522) are switched on again on attach and
+  off on detach, so that they no longer arrive in the shell as junk.
+- Detaching in the middle of a synchronized update no longer leaves the
+  terminal's screen frozen.
+- Attaching no longer flickers: the terminal holds its picture still while
+  history and the program's repaint go in, and shows them at once. Until
+  then it says that the session is being restored.
+- The window has the size of the terminal used last (attached, typed or
+  clicked in), not of the last one to attach or resize. When that terminal
+  detaches, the one used before it gets its size back. A terminal that is
+  not in use, such as a phone's in the background, no longer changes the
+  size, and its in-band size reports no longer reach the program.
+- The detach and suspend keys work when the program has switched on the
+  kitty keyboard protocol or modifyOtherKeys, as omp does.
+
+The protocol is now version 4. A new client still attaches to a session
+started by 0.1.0, without the pixel size or the held picture; the master
+side of these changes needs the session to be restarted.
+
 ## 0.1.0
 
 First release. `ratch` is a rewrite in Rust of
