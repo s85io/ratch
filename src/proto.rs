@@ -11,7 +11,9 @@
 
 use std::fmt;
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 4;
+/// The first version that can be sent [`ServerMsg::Settled`].
+pub const VERSION_SETTLED: u16 = 4;
 pub const MAX_PAYLOAD: usize = 4096;
 const HEADER: usize = 4;
 const HELLO_MAGIC: [u8; 2] = *b"at";
@@ -73,6 +75,9 @@ pub struct Attach {
     pub replay: Replay,
     pub rows: u16,
     pub cols: u16,
+    /// The window in pixels, 0 where unknown; programs that draw images use it.
+    pub xpixel: u16,
+    pub ypixel: u16,
     /// Watch only: this client's input is not passed to the program.
     pub readonly: bool,
     /// Just the bytes: history whatever the program is doing now, and no
@@ -99,6 +104,8 @@ pub enum ClientMsg<'a> {
     Resize {
         rows: u16,
         cols: u16,
+        xpixel: u16,
+        ypixel: u16,
     },
     Redraw {
         method: Redraw,
@@ -123,6 +130,8 @@ pub enum ServerMsg<'a> {
     ReplayEnd,
     /// This client fell too far behind and some output was dropped for it.
     Skipped,
+    /// After an attach: the program has repainted, the screen may be shown.
+    Settled,
     Exit(Exit),
     Ack,
     Error(&'a str),
@@ -146,6 +155,7 @@ mod kind {
     pub const EXIT: u8 = 0x85;
     pub const ACK: u8 = 0x86;
     pub const ERROR: u8 = 0x87;
+    pub const SETTLED: u8 = 0x88;
 }
 
 const FLAG_READONLY: u8 = 1;
@@ -170,6 +180,24 @@ fn u16_at(p: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([p[at], p[at + 1]])
 }
 
+/// The window's size in pixels goes at the end of a message, and only when
+/// it is known: a master older than version 3 takes the message without it.
+fn pixels_end(at: usize, xpixel: u16, ypixel: u16) -> usize {
+    if xpixel == 0 && ypixel == 0 {
+        at
+    } else {
+        at + 4
+    }
+}
+
+fn pixels_at(p: &[u8], at: usize) -> u16 {
+    if p.len() >= at + 2 {
+        u16_at(p, at)
+    } else {
+        0
+    }
+}
+
 impl ClientMsg<'_> {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match *self {
@@ -188,19 +216,33 @@ impl ClientMsg<'_> {
                     Replay::None => 0,
                     Replay::Lines(n) => n.clamp(1, u32::MAX - 1),
                 };
-                let mut p = [0u8; 9];
+                let mut p = [0u8; 13];
                 p[..4].copy_from_slice(&replay.to_le_bytes());
                 p[4..6].copy_from_slice(&a.rows.to_le_bytes());
                 p[6..8].copy_from_slice(&a.cols.to_le_bytes());
                 p[8] = a.redraw as u8;
+                p[9..11].copy_from_slice(&a.xpixel.to_le_bytes());
+                p[11..13].copy_from_slice(&a.ypixel.to_le_bytes());
                 let flags = (u8::from(a.readonly) * FLAG_READONLY) | (u8::from(a.dump) * FLAG_DUMP);
-                frame(out, kind::ATTACH, flags, &p);
+                frame(
+                    out,
+                    kind::ATTACH,
+                    flags,
+                    &p[..pixels_end(9, a.xpixel, a.ypixel)],
+                );
             }
             ClientMsg::Detach => frame(out, kind::DETACH, 0, &[]),
             ClientMsg::Input(data) => frames(out, kind::INPUT, data),
-            ClientMsg::Resize { rows, cols } => {
+            ClientMsg::Resize {
+                rows,
+                cols,
+                xpixel,
+                ypixel,
+            } => {
                 let (r, c) = (rows.to_le_bytes(), cols.to_le_bytes());
-                frame(out, kind::RESIZE, 0, &[r[0], r[1], c[0], c[1]]);
+                let (x, y) = (xpixel.to_le_bytes(), ypixel.to_le_bytes());
+                let p = [r[0], r[1], c[0], c[1], x[0], x[1], y[0], y[1]];
+                frame(out, kind::RESIZE, 0, &p[..pixels_end(4, xpixel, ypixel)]);
             }
             ClientMsg::Redraw { method, rows, cols } => {
                 let (r, c) = (rows.to_le_bytes(), cols.to_le_bytes());
@@ -224,7 +266,7 @@ impl ClientMsg<'_> {
             (kind::HELLO, 4) if p[..2] == HELLO_MAGIC => ClientMsg::Hello {
                 version: u16_at(p, 2),
             },
-            (kind::ATTACH, 9) => ClientMsg::Attach(Attach {
+            (kind::ATTACH, 9 | 13) => ClientMsg::Attach(Attach {
                 replay: match u32::from_le_bytes([p[0], p[1], p[2], p[3]]) {
                     u32::MAX => Replay::Default,
                     0 => Replay::None,
@@ -232,15 +274,19 @@ impl ClientMsg<'_> {
                 },
                 rows: u16_at(p, 4),
                 cols: u16_at(p, 6),
+                xpixel: pixels_at(p, 9),
+                ypixel: pixels_at(p, 11),
                 readonly: f.flags & FLAG_READONLY != 0,
                 dump: f.flags & FLAG_DUMP != 0,
                 redraw: Redraw::from_u8(p[8]).ok_or(bad)?,
             }),
             (kind::DETACH, 0) => ClientMsg::Detach,
             (kind::INPUT, _) => ClientMsg::Input(p),
-            (kind::RESIZE, 4) => ClientMsg::Resize {
+            (kind::RESIZE, 4 | 8) => ClientMsg::Resize {
                 rows: u16_at(p, 0),
                 cols: u16_at(p, 2),
+                xpixel: pixels_at(p, 4),
+                ypixel: pixels_at(p, 6),
             },
             (kind::REDRAW, 5) => ClientMsg::Redraw {
                 method: Redraw::from_u8(p[4]).ok_or(bad)?,
@@ -268,6 +314,7 @@ impl ServerMsg<'_> {
             ServerMsg::Output(data) => frames(out, kind::OUTPUT, data),
             ServerMsg::ReplayEnd => frame(out, kind::REPLAY_END, 0, &[]),
             ServerMsg::Skipped => frame(out, kind::SKIPPED, 0, &[]),
+            ServerMsg::Settled => frame(out, kind::SETTLED, 0, &[]),
             ServerMsg::Exit(Exit::Code(code)) => frame(out, kind::EXIT, 0, &[code]),
             ServerMsg::Exit(Exit::Signal(sig)) => frame(out, kind::EXIT, FLAG_SIGNALED, &[sig]),
             ServerMsg::Ack => frame(out, kind::ACK, 0, &[]),
@@ -292,11 +339,12 @@ impl ServerMsg<'_> {
             (kind::OUTPUT, _) => ServerMsg::Output(p),
             (kind::REPLAY_END, 0) => ServerMsg::ReplayEnd,
             (kind::SKIPPED, 0) => ServerMsg::Skipped,
+            (kind::SETTLED, 0) => ServerMsg::Settled,
             (kind::EXIT, 1) if f.flags & FLAG_SIGNALED != 0 => ServerMsg::Exit(Exit::Signal(p[0])),
             (kind::EXIT, 1) => ServerMsg::Exit(Exit::Code(p[0])),
             (kind::ACK, 0) => ServerMsg::Ack,
             (kind::ERROR, _) => ServerMsg::Error(std::str::from_utf8(p).map_err(|_| bad)?),
-            (kind::HELLO_ACK..=kind::ERROR, _) => return Err(bad),
+            (kind::HELLO_ACK..=kind::SETTLED, _) => return Err(bad),
             (other, _) => return Err(ProtoError::UnknownType(other)),
         })
     }
@@ -373,6 +421,8 @@ mod tests {
                 replay: Replay::Lines(100),
                 rows: 50,
                 cols: 200,
+                xpixel: 1600,
+                ypixel: 1000,
                 readonly: true,
                 dump: true,
                 redraw: Redraw::CtrlL,
@@ -384,7 +434,18 @@ mod tests {
             ClientMsg::Detach,
             ClientMsg::Input(b"ls -la\r"),
             ClientMsg::Input(b""),
-            ClientMsg::Resize { rows: 24, cols: 80 },
+            ClientMsg::Resize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            },
+            ClientMsg::Resize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 1,
+            },
             ClientMsg::Redraw {
                 method: Redraw::Winch,
                 rows: 1,
@@ -405,6 +466,7 @@ mod tests {
             ServerMsg::Output(b"\x1b[1mhello\x1b[m\r\n"),
             ServerMsg::ReplayEnd,
             ServerMsg::Skipped,
+            ServerMsg::Settled,
             ServerMsg::Exit(Exit::Code(0)),
             ServerMsg::Exit(Exit::Code(127)),
             ServerMsg::Exit(Exit::Signal(9)),
@@ -428,6 +490,24 @@ mod tests {
             assert_eq!(ClientMsg::decode(&frame).unwrap(), msg);
             assert_eq!(decoder.next().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn without_pixels_messages_are_as_version_2_had_them() {
+        let len = |msg: ClientMsg<'_>| {
+            let mut bytes = Vec::new();
+            msg.encode(&mut bytes);
+            bytes.len() - HEADER
+        };
+        assert_eq!(len(ClientMsg::Attach(Attach::default())), 9);
+        let resize = |xpixel| ClientMsg::Resize {
+            rows: 24,
+            cols: 80,
+            xpixel,
+            ypixel: 0,
+        };
+        assert_eq!(len(resize(0)), 4);
+        assert_eq!(len(resize(800)), 8);
     }
 
     #[test]

@@ -116,7 +116,8 @@ impl Raw {
         loop {
             if let Some(frame) = self.decoder.next().unwrap() {
                 return match ServerMsg::decode(&frame).unwrap() {
-                    ServerMsg::HelloAck { .. } => continue,
+                    // Only the terminal hold in the real client cares.
+                    ServerMsg::HelloAck { .. } | ServerMsg::Settled => continue,
                     ServerMsg::Output(data) => Ev::Output(data.to_vec()),
                     ServerMsg::ReplayEnd => Ev::ReplayEnd,
                     ServerMsg::Skipped => Ev::Skipped,

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod filter;
+pub mod input;
 pub mod modes;
 pub mod parser;
 

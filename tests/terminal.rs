@@ -23,9 +23,13 @@ struct Term {
 
 impl Term {
     fn spawn(home: &Home, args: &[&str]) -> Term {
+        Term::sized(home, args, 24, 80)
+    }
+
+    fn sized(home: &Home, args: &[&str], rows: u16, cols: u16) -> Term {
         let size = Winsize {
-            ws_row: 24,
-            ws_col: 80,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -217,6 +221,148 @@ fn resizing_the_terminal_resizes_the_program() {
     };
     sys::set_winsize(&term.master, size).unwrap();
     term.expect("40 132");
+    term.send(DETACH);
+    term.finish();
+}
+
+/// Programs on Node or Bun, Claude Code among them, ignore a SIGWINCH that
+/// comes without a new size. Attaching at the size the program already has
+/// must still get it to repaint, and leave the size as it was.
+#[test]
+fn a_program_that_repaints_only_for_a_new_size_repaints_on_attach() {
+    let home = Home::new("samesize");
+    let script = "last=$(stty size); echo \"size $last\"; \
+        trap 'now=$(stty size); [ \"$now\" = \"$last\" ] || { last=$now; echo \"size $now\"; }' WINCH; \
+        while :; do sleep 0.05; done";
+    let mut term = Term::spawn(&home, &["new", "s", "sh", "-c", script]);
+    term.expect("size 24 80");
+    term.send(DETACH);
+    term.finish();
+
+    // Without history, so that what is seen is new; a watcher too.
+    for args in [
+        &["attach", "-n", "0", "s"][..],
+        &["attach", "--ro", "-n", "0", "s"],
+    ] {
+        let mut term = Term::spawn(&home, args);
+        term.expect("size 24 80");
+        // Long enough for the real size to have come back.
+        std::thread::sleep(Duration::from_millis(1500));
+        for _ in 0..10 {
+            term.pump(Duration::from_millis(50));
+        }
+        let seen = String::from_utf8_lossy(&term.seen).into_owned();
+        let last = seen.rmatch_indices("size ").next().map(|(i, _)| &seen[i..]);
+        assert!(
+            last.is_some_and(|l| l.starts_with("size 24 80")),
+            "{args:?}: {seen:?}"
+        );
+        term.send(DETACH);
+        term.finish();
+    }
+}
+
+/// A desktop and a phone on one session: the window has the size of the
+/// terminal in use, and gets the other's back when that one leaves.
+#[test]
+fn the_size_follows_the_terminal_in_use() {
+    let home = Home::new("owner");
+    let script = "trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done";
+    let mut desk = Term::spawn(&home, &["new", "s", "sh", "-c", script]);
+    desk.expect("24 80");
+
+    let mut phone = Term::sized(&home, &["attach", "-n", "0", "s"], 20, 45);
+    phone.expect("20 45");
+    // Leaving gives the window back to the desktop.
+    phone.send(DETACH);
+    phone.finish();
+    desk.mark();
+    desk.expect("24 80");
+
+    let mut phone = Term::sized(&home, &["attach", "-n", "0", "s"], 20, 45);
+    phone.expect("20 45");
+    // A key on the desktop takes the window back.
+    desk.mark();
+    desk.send(b"\x1b[I");
+    desk.expect("24 80");
+    // The phone's terminal changing size while it is not in use changes
+    // nothing; nor does a phone going into the background.
+    desk.mark();
+    let smaller = Winsize {
+        ws_row: 18,
+        ws_col: 40,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    sys::set_winsize(&phone.master, smaller).unwrap();
+    phone.send(b"\x1b[O");
+    std::thread::sleep(Duration::from_millis(500));
+    for _ in 0..5 {
+        desk.pump(Duration::from_millis(50));
+    }
+    assert!(
+        !contains(&desk.seen, b"18 40"),
+        "{:?}",
+        String::from_utf8_lossy(&desk.seen)
+    );
+    // Until the desktop leaves.
+    desk.send(DETACH);
+    desk.finish();
+    phone.expect("18 40");
+    phone.send(DETACH);
+    phone.finish();
+}
+
+/// With the kitty keyboard protocol on, which agents such as omp switch on,
+/// Ctrl-\ arrives as an escape sequence.
+#[test]
+fn the_detach_key_works_in_the_kitty_keyboard_protocol() {
+    let home = Home::new("kitty");
+    let mut term = Term::spawn(
+        &home,
+        &[
+            "new",
+            "s",
+            "sh",
+            "-c",
+            "printf '\\033[>1u'; echo ready; sleep 1000",
+        ],
+    );
+    term.expect("ready");
+    term.send(b"\x1b[92;5u");
+    let (seen, _) = term.finish();
+    assert!(seen.contains("detached"), "{seen:?}");
+}
+
+/// History and the program's repaint go in while the terminal holds its
+/// picture, and are shown at once.
+#[test]
+fn attaching_holds_the_picture_until_the_program_has_drawn() {
+    let home = Home::new("still");
+    home.start(
+        "s",
+        "echo old-output; trap 'printf \"\\033[?2026hframe\\033[?2026l\"' WINCH; while :; do sleep 0.05; done",
+    );
+    assert!(eventually(SOON, || {
+        std::fs::read(home.file("s.log")).is_ok_and(|log| contains(&log, b"old-output"))
+    }));
+    std::thread::sleep(Duration::from_millis(2100));
+    let mut term = Term::spawn(&home, &["attach", "s"]);
+    term.expect("frame");
+    std::thread::sleep(Duration::from_millis(300));
+    term.pump(Duration::from_millis(100));
+    let seen = String::from_utf8_lossy(&term.seen).into_owned();
+    let begin = seen.find("\x1b[?2026h").expect("no hold");
+    let status = seen.find("restoring session 's'").expect("no status");
+    let old = seen.find("old-output").unwrap();
+    let frame = seen.find("frame").unwrap();
+    let end = seen.rfind("\x1b[?2026l").expect("not released");
+    assert!(
+        status < begin && begin < old && old < frame && frame < end,
+        "{seen:?}"
+    );
+    // The program's own update did not end the hold early.
+    assert_eq!(seen.matches("\x1b[?2026l").count(), 1, "{seen:?}");
     term.send(DETACH);
     term.finish();
 }

@@ -87,6 +87,11 @@ pub fn is_reply(token: &Token<'_>) -> bool {
     }
 }
 
+/// Does this begin or end a synchronized update (mode 2026)?
+pub fn is_sync(token: &Token<'_>) -> bool {
+    matches!(token, Token::Csi(csi) if csi.raw == b"\x1b[?2026h" || csi.raw == b"\x1b[?2026l")
+}
+
 /// Passes a stream through, minus the tokens a predicate picks out.
 #[derive(Debug)]
 pub struct Filter {
@@ -108,6 +113,15 @@ impl Filter {
         Filter {
             parser: Parser::new(),
             drop: is_reply,
+        }
+    }
+
+    /// For output while the terminal is held still for an attach: drops the
+    /// program's own synchronized updates, whose end would let it go early.
+    pub fn sync() -> Filter {
+        Filter {
+            parser: Parser::new(),
+            drop: is_sync,
         }
     }
 
@@ -274,6 +288,16 @@ mod tests {
             through(b"\x1b[2;2R\x1b[>0;10;1c\x1b]10;rgb:cccc/cccc/cccc\x07\x1b[?12;2$y"),
             b""
         );
+    }
+
+    #[test]
+    fn synchronized_updates_are_taken_out() {
+        let mut out = Vec::new();
+        let mut filter = Filter::sync();
+        filter.feed(b"\x1b[?2026hframe\x1b[?20", &mut out);
+        filter.feed(b"26l\x1b[?2026$p\x1b[?25l", &mut out);
+        filter.finish(&mut out);
+        assert_eq!(out, b"frame\x1b[?2026$p\x1b[?25l");
     }
 
     #[test]

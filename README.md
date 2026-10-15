@@ -167,6 +167,34 @@ eval "$(ratch env)"           # bash, zsh
 ratch env --fish | source     # fish
 ```
 
+## 🤖 Coding agents
+
+ratch is tuned for agents that live in a terminal for hours: Claude Code,
+omp and the like. The pieces fit: ratch keeps the program running and the
+terminal's history, the agent keeps its conversation.
+
+```sh
+ratch work claude                  # an agent you can walk away from
+ratch work                         # later, from the laptop or the phone
+ratch work claude --continue       # after a reboot: new session, same conversation
+ratch work omp -c
+```
+
+- 🎬 **No flicker on attach.** The terminal's picture is held still while
+  history and the agent's repaint go in, then shown at once (synchronized
+  output; Ghostty, kitty, iTerm2, WezTerm and others have it). Meanwhile
+  it says `[ratch: restoring session 'work']`.
+- 📜 **Scrolling back** is the terminal's own. Claude Code does not reprint
+  its conversation when it repaints, so what you scroll through is the
+  history ratch replays (`-n` sets how much). omp reprints its own and
+  clears what was there.
+- 📱 **Desktop and phone.** The window has the size of the terminal used
+  last: attached, typed or clicked in. When the phone detaches, the desktop
+  gets its size back at once; a phone's terminal in the background does
+  not shrink it.
+- ⌨️ **The detach key** still works when the agent switches on the kitty
+  keyboard protocol, as omp does.
+
 ## 📁 Files and environment
 
 Sessions live in `~/.cache/ratch` (or `$RATCH_SESSION_DIR`), which must be
@@ -192,8 +220,8 @@ A copy of the binary under another name keeps to itself: `foo` uses
 ## ⚠️ Good to know
 
 - 🔐 Any process running as you can attach to, type into and stop your sessions; nobody else can.
-- 🖼️ There is no picture of the screen: after attaching, a full-screen program repaints itself. One that ignores window changes stays blank until it draws again; try `-r ctrl_l`.
-- 📐 Terminals attached to one session share one window size: the last to attach or resize sets it.
+- 🖼️ There is no picture of the screen: after attaching, a full-screen program repaints itself. It is told the window changed; when the size is the same, the window is made a column narrower for a moment, because programs on Node or Bun (Claude Code, omp) ignore a change that is not one. One that ignores window changes altogether stays blank until it draws again; try `-r ctrl_l`.
+- 📐 Terminals attached to one session share one window size: that of the terminal used last (attached, typed or clicked in). When it detaches, the one used before it takes over.
 - 🔁 A session cannot be attached, or killed without `-f`, from inside itself.
 - 🐡 Linux and macOS are supported. On FreeBSD it builds and mostly works, but the output of a program that exits immediately after writing can be lost.
 - 🧹 With systemd's `KillUserProcesses=yes`, sessions die at logout; `loginctl enable-linger` keeps them.

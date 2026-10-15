@@ -16,13 +16,15 @@ use super::parser::{Csi, Token};
 
 /// DEC private modes worth carrying across an attach, in the order they are
 /// restored. The alternate screen comes first because entering it clears it.
-const MODES: [u16; 17] = [
+const MODES: [u16; 20] = [
     47, 1047, 1049, // alternate screen
     1, 7, // cursor keys, autowrap
     9, 1000, 1002, 1003, // mouse reporting
     1005, 1006, 1015, 1016, // mouse encoding
     1004, 1007, 2004, // focus events, alternate scroll, bracketed paste
-    25,   // cursor visibility, last so the cursor does not flicker
+    // Reports the terminal sends unasked: colour scheme changes, window size
+    // changes, pastes (kitty). Left on, they turn up as junk in the shell.
+    2031, 2048, 5522, 25, // cursor visibility, last so the cursor does not flicker
 ];
 
 const ALT_SCREEN: [u16; 3] = [47, 1047, 1049];
@@ -366,6 +368,13 @@ mod tests {
             restore(b"\x1b[>1u\x1b[?1049h\x1b[>7u\x1b[<u\x1b[?1049l"),
             "\x1b[>1u"
         );
+    }
+
+    #[test]
+    fn reports_the_terminal_sends_unasked() {
+        let omp = b"\x1b[?2004h\x1b[?2031h\x1b[?2048h\x1b[?5522h";
+        assert_eq!(restore(omp), "\x1b[?2004h\x1b[?2031h\x1b[?2048h\x1b[?5522h");
+        assert_eq!(reset(omp), "\x1b[?5522l\x1b[?2048l\x1b[?2031l\x1b[?2004l");
     }
 
     #[test]

@@ -10,10 +10,12 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::proto::{Attach, ClientMsg, Decoder, Exit, Redraw, Replay, ServerMsg, VERSION};
+use crate::proto::{
+    Attach, ClientMsg, Decoder, Exit, Redraw, Replay, ServerMsg, VERSION, VERSION_SETTLED,
+};
 use crate::session::{Names, Probe, Session};
 use crate::sys::{self, signal, PollFd, PollFlags, Signals};
-use crate::vt::{Modes, Parser};
+use crate::vt::{input, Filter, Modes, Parser};
 
 /// Why a session could not be reached.
 pub enum Unreachable {
@@ -28,6 +30,7 @@ pub enum Event<'a> {
     Output(&'a [u8]),
     ReplayEnd,
     Skipped,
+    Settled,
     Exit(Exit),
     Ack,
     Error(&'a str),
@@ -39,6 +42,8 @@ pub struct Link {
     decoder: Decoder,
     /// Which session this is, whatever it is called now.
     pub session_id: u64,
+    /// The protocol version the master speaks.
+    pub version: u16,
 }
 
 const GREETING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +61,7 @@ impl Link {
             stream,
             decoder: Decoder::new(),
             session_id: 0,
+            version: 0,
         };
         match link.greet() {
             Ok(true) => Ok(link),
@@ -74,8 +80,9 @@ impl Link {
         loop {
             if let Some(frame) = self.decoder.next().map_err(io::Error::other)? {
                 return match ServerMsg::decode(&frame) {
-                    Ok(ServerMsg::HelloAck { session, .. }) => {
+                    Ok(ServerMsg::HelloAck { version, session }) => {
                         self.session_id = session;
+                        self.version = version;
                         let _ = self.stream.set_read_timeout(None);
                         Ok(true)
                     }
@@ -119,6 +126,7 @@ impl Link {
                 ServerMsg::Output(data) => Event::Output(data),
                 ServerMsg::ReplayEnd => Event::ReplayEnd,
                 ServerMsg::Skipped => Event::Skipped,
+                ServerMsg::Settled => Event::Settled,
                 ServerMsg::Exit(exit) => Event::Exit(exit),
                 ServerMsg::Ack => Event::Ack,
                 ServerMsg::Error(text) => Event::Error(text),
@@ -257,8 +265,9 @@ impl Terminal {
         if self.plain {
             return;
         }
-        // The first two end any sequence the program left unfinished.
-        let mut bytes = b"\x18\x1b\\".to_vec();
+        // The first two end any sequence the program left unfinished, the
+        // third a synchronized update, which would keep the screen frozen.
+        let mut bytes = b"\x18\x1b\\\x1b[?2026l".to_vec();
         self.modes.reset(&mut bytes);
         bytes.extend_from_slice(b"\x1b[0m\x1b[?25h");
         let _ = sys::write_stdout(&bytes);
@@ -281,8 +290,25 @@ impl Drop for Terminal {
     }
 }
 
-fn window() -> (u16, u16) {
-    sys::winsize_of(sys::stdin_fd()).map_or((0, 0), |ws| (ws.ws_row, ws.ws_col))
+/// The terminal's size: rows, columns, and pixels if the master can take them.
+fn window(link: &Link) -> (u16, u16, u16, u16) {
+    let Some(ws) = sys::winsize_of(sys::stdin_fd()) else {
+        return (0, 0, 0, 0);
+    };
+    if link.version < 3 {
+        return (ws.ws_row, ws.ws_col, 0, 0);
+    }
+    (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel)
+}
+
+fn resize_msg(link: &Link) -> ClientMsg<'static> {
+    let (rows, cols, xpixel, ypixel) = window(link);
+    ClientMsg::Resize {
+        rows,
+        cols,
+        xpixel,
+        ypixel,
+    }
 }
 
 fn age_since(start: SystemTime) -> String {
@@ -293,6 +319,52 @@ fn age_since(start: SystemTime) -> String {
 fn in_own_ancestry(names: &Names, link: &Link) -> bool {
     let wanted = format!("{:016x}", link.session_id);
     std::env::var(names.id_var()).is_ok_and(|chain| chain.split(':').any(|id| id == wanted))
+}
+
+/// Keeps the picture on the terminal still while an attach is under way:
+/// history and the program's repaint go in unseen and appear at once,
+/// instead of scrolling and flickering past. Terminals that do not know
+/// synchronized output (mode 2026) ignore it and show it all as it comes.
+struct Hold {
+    /// Takes out the program's own synchronized updates, whose end would
+    /// let the picture go early.
+    filter: Filter,
+    until: Instant,
+}
+
+/// Longer than this and a terminal shows what it has anyway.
+const HOLD_MAX: Duration = Duration::from_millis(1500);
+
+impl Hold {
+    fn start(term: &mut Terminal, status: Option<&str>) -> Hold {
+        if let Some(text) = status {
+            // Shown while the picture is held, gone once it moves on.
+            let _ = sys::write_stdout(format!("\r\x1b[K\x1b[2m{text}\x1b[m").as_bytes());
+            // Give the terminal a frame to draw it before it is held.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = term.write(b"\x1b[?2026h");
+        if status.is_some() {
+            let _ = term.write(b"\r\x1b[K");
+        }
+        Hold {
+            filter: Filter::sync(),
+            until: Instant::now() + HOLD_MAX,
+        }
+    }
+
+    fn pass(&mut self, output: &[u8]) -> Vec<u8> {
+        let mut kept = Vec::with_capacity(output.len());
+        self.filter.feed(output, &mut kept);
+        kept
+    }
+
+    fn release(mut self, term: &mut Terminal) {
+        let mut rest = Vec::new();
+        self.filter.finish(&mut rest);
+        rest.extend_from_slice(b"\x1b[?2026l");
+        let _ = term.write(&rest);
+    }
 }
 
 /// Attach the terminal to a session until the user detaches or it ends.
@@ -324,18 +396,28 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
     if opts.clear && !opts.plain {
         let _ = term.write(b"\x1b[H\x1b[2J\x1b[3J");
     }
-    let attach_msg = |replay| {
-        let (rows, cols) = window();
+    let attach_msg = |link: &Link, replay| {
+        let (rows, cols, xpixel, ypixel) = window(link);
         ClientMsg::Attach(Attach {
             replay,
             rows,
             cols,
+            xpixel,
+            ypixel,
             readonly: opts.readonly,
             dump: false,
             redraw: opts.redraw,
         })
     };
-    let mut ok = link.send(attach_msg(opts.replay)).is_ok();
+    // A session just created has nothing to restore.
+    let restoring = started
+        .elapsed()
+        .map_or(true, |age| age > Duration::from_secs(2));
+    let status = format!("[{prog}: restoring session '{name}']");
+    let status = (restoring && !opts.quiet).then_some(status.as_str());
+    let holds = !opts.plain && link.version >= VERSION_SETTLED;
+    let mut hold = holds.then(|| Hold::start(&mut term, status));
+    let mut ok = link.send(attach_msg(&link, opts.replay)).is_ok();
     // While history is being played, the terminal may be answering queries
     // in it. Those answers arrive on stdin like typing and are picked out.
     let mut replies = Some(crate::vt::Filter::replies());
@@ -356,7 +438,13 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             PollFd::from_borrowed_fd(sys::stdin_fd(), PollFlags::IN),
             PollFd::new(&link, PollFlags::IN),
         ];
-        if sys::poll(&mut fds, None).is_err() {
+        let timeout = hold.as_ref().map(|h| {
+            h.until
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u32
+                + 1
+        });
+        if sys::poll(&mut fds, timeout).is_err() {
             farewell(
                 &mut term,
                 format!("select failed after {}", age_since(started)),
@@ -364,6 +452,11 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             return 1;
         }
         let ready = fds.map(|fd| !fd.revents().is_empty());
+        if hold.as_ref().is_some_and(|h| Instant::now() >= h.until) {
+            if let Some(h) = hold.take() {
+                h.release(&mut term);
+            }
+        }
 
         if ready[0] {
             signals.drain();
@@ -386,8 +479,7 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
                 }
             }
             if signals.take(signal::SIGWINCH) {
-                let (rows, cols) = window();
-                ok &= link.send(ClientMsg::Resize { rows, cols }).is_ok();
+                ok &= link.send(resize_msg(&link)).is_ok();
             }
         }
 
@@ -395,18 +487,28 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             let mut output = Vec::new();
             let mut failed = None;
             let mut history_done = false;
+            let mut settled = false;
             let open = link.read(|event| match event {
                 Event::Output(data) => output.extend_from_slice(data),
                 Event::ReplayEnd => history_done = true,
                 Event::Error(text) => failed = Some(text.to_owned()),
+                Event::Settled => settled = true,
                 Event::Skipped | Event::Exit(_) | Event::Ack => {}
             });
+            if let Some(h) = hold.as_mut() {
+                output = h.pass(&output);
+            }
             if term.write(&output).is_err() {
                 farewell(
                     &mut term,
                     format!("write failed after {}", age_since(started)),
                 );
                 return 1;
+            }
+            if settled {
+                if let Some(h) = hold.take() {
+                    h.release(&mut term);
+                }
             }
             if history_done {
                 // Anything the filter was still holding is typing after all.
@@ -457,18 +559,22 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
             }
             // A key means something to us only when it arrives on its own,
             // as typed keys do; inside pasted text it is just text.
-            if !opts.no_suspend && suspend_key != 0 && keys[0] == suspend_key {
+            if !opts.no_suspend && suspend_key != 0 && input::starts_with_key(keys, suspend_key) {
                 ok &= link.send(ClientMsg::Detach).is_ok();
                 term.leave();
                 let _ = sys::write_stdout(place.as_bytes());
                 sys::suspend_self();
                 // Back in the foreground.
                 term.enter();
-                ok &= link.send(attach_msg(opts.replay)).is_ok();
+                hold = holds.then(|| Hold::start(&mut term, status));
+                ok &= link.send(attach_msg(&link, opts.replay)).is_ok();
                 replies = Some(crate::vt::Filter::replies());
                 continue;
             }
-            if opts.detach == Some(keys[0]) {
+            if opts
+                .detach
+                .is_some_and(|key| input::starts_with_key(keys, key))
+            {
                 let _ = link.send(ClientMsg::Detach);
                 farewell(&mut term, format!("detached after {}", age_since(started)));
                 return 0;
@@ -477,10 +583,9 @@ pub fn attach(names: &Names, session: &Session, mut link: Link, opts: &Options) 
                 continue;
             }
             ok &= link.send(ClientMsg::Input(keys)).is_ok();
-            if keys[0] == 0x0c {
+            if input::starts_with_key(keys, 0x0c) {
                 // The user asked for a repaint; make sure the size is right.
-                let (rows, cols) = window();
-                ok &= link.send(ClientMsg::Resize { rows, cols }).is_ok();
+                ok &= link.send(resize_msg(&link)).is_ok();
             }
         }
     }
@@ -716,7 +821,7 @@ impl Printer {
 
     fn finish(&mut self) {
         if let Some((_, _, modes)) = self.terminal.take() {
-            let mut bytes = b"\x18\x1b\\".to_vec();
+            let mut bytes = b"\x18\x1b\\\x1b[?2026l".to_vec();
             modes.reset(&mut bytes);
             bytes.extend_from_slice(b"\x1b[0m\x1b[?25h");
             let _ = sys::write_stdout(&bytes);

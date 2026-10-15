@@ -23,11 +23,12 @@ use rustix::fs::OFlags;
 
 use crate::proto::{
     Attach, ClientMsg, Decoder, Exit, Redraw, Replay, ServerMsg, MAX_PAYLOAD, VERSION,
+    VERSION_SETTLED,
 };
 use crate::ring::Ring;
 use crate::session::{Info, Lock, Names, Probe, Session, SockId};
 use crate::sys::{self, signal, PollFd, PollFlags, Signals, Winsize};
-use crate::vt::{Filter, Modes, Parser, Token};
+use crate::vt::{input, Filter, Modes, Parser, Token};
 
 /// Output kept in memory. Independent of the log: a session without a log
 /// still has history to show.
@@ -44,6 +45,17 @@ const OUT_HIGH: usize = 16 * 1024;
 const FIRST_ATTACH: Duration = Duration::from_secs(5);
 /// How long clients get to read the last output after the program is gone.
 const DRAIN: Duration = Duration::from_secs(2);
+/// A repaint by window change may go through a size one column narrower
+/// (see [`Nudge`]); the real size comes back once the program has answered
+/// and gone quiet for a moment, within these bounds.
+const NUDGE_MIN: Duration = Duration::from_millis(80);
+const NUDGE_MAX: Duration = Duration::from_millis(700);
+/// Then, the same for the repaint at the real size; an attaching terminal
+/// is kept still until it is over.
+const REPAINT_MIN: Duration = Duration::from_millis(30);
+const REPAINT_MAX: Duration = Duration::from_millis(500);
+/// Silence that says the program has finished drawing.
+const QUIET: Duration = Duration::from_millis(40);
 
 pub struct Config {
     pub names: Names,
@@ -139,8 +151,17 @@ enum Phase {
 }
 
 struct Client {
+    id: u64,
     stream: UnixStream,
     decoder: Decoder,
+    /// The protocol version it greeted us with.
+    version: u16,
+    /// Its terminal's size, as last heard.
+    size: Option<Winsize>,
+    /// When someone last used it: attached, typed, clicked.
+    active: Instant,
+    /// Owed a word that the program has repainted for it.
+    settle: bool,
     /// Encoded frames not yet written, from `out_at` on.
     out: Vec<u8>,
     out_at: usize,
@@ -161,10 +182,15 @@ struct Client {
 }
 
 impl Client {
-    fn new(stream: UnixStream) -> Client {
+    fn new(id: u64, stream: UnixStream) -> Client {
         Client {
+            id,
             stream,
             decoder: Decoder::new(),
+            version: 0,
+            size: None,
+            active: Instant::now(),
+            settle: false,
             out: Vec::new(),
             out_at: 0,
             pos: 0,
@@ -189,6 +215,11 @@ impl Client {
 
     fn attached(&self) -> bool {
         !matches!(self.phase, Phase::Idle)
+    }
+
+    /// Can it be the terminal whose size the window has?
+    fn may_size(&self) -> bool {
+        self.attached() && !self.readonly && !self.dump && self.size.is_some()
     }
 
     /// Write as much pending output as the socket takes.
@@ -224,7 +255,8 @@ impl Client {
         };
         // Its terminal may be in the middle of a sequence we never finished:
         // CAN cancels one, ST ends a string, and both are harmless otherwise.
-        let mut resume = b"\x18\x1b\\".to_vec();
+        // Likewise a synchronized update whose end it will never see.
+        let mut resume = b"\x18\x1b\\\x1b[?2026l".to_vec();
         if !self.dump {
             self.send(ServerMsg::Output(&resume));
         }
@@ -285,12 +317,52 @@ impl Client {
     }
 }
 
+/// The second half of a repaint by window change.
+///
+/// Many programs repaint on SIGWINCH only if the size really changed: all
+/// that run on Node or Bun (Claude Code, omp and other agents), and others
+/// that compare. For a terminal of the size the program already has, the
+/// window is made one column narrower first, and the real size put back
+/// once the program has had time to see it; each change is a real one.
+struct Nudge {
+    size: Winsize,
+    watch: Watch,
+}
+
+/// Waiting for the program to answer a window change: it is done when it has
+/// written and then gone quiet, or when it has had long enough.
+struct Watch {
+    since: Instant,
+    /// When the program last wrote since then.
+    heard: Option<Instant>,
+    min: Duration,
+    max: Duration,
+}
+
+impl Watch {
+    fn new(min: Duration, max: Duration) -> Watch {
+        Watch {
+            since: Instant::now(),
+            heard: None,
+            min,
+            max,
+        }
+    }
+
+    fn due(&self) -> Instant {
+        let after = self.heard.map_or(self.since + self.max, |t| t + QUIET);
+        after.max(self.since + self.min).min(self.since + self.max)
+    }
+}
+
 /// A client message, detached from the buffer it was decoded from.
 enum Cmd {
-    Hello,
+    Hello(u16),
+    /// Someone is using this client's terminal.
+    Active,
     Attach(Attach),
     Detach,
-    Resize(u16, u16),
+    Resize(Winsize),
     Redraw(Redraw, u16, u16),
     Signal(u8),
     Clear,
@@ -317,10 +389,28 @@ struct Master<'a> {
     log: Option<Log>,
     info: Info,
     redraw: Redraw,
+    nudge: Option<Nudge>,
+    /// Waiting for the program to repaint at the size it now has.
+    repaint: Option<Watch>,
+    /// The client whose terminal's size the window has: the one used last.
+    owner: Option<u64>,
+    next_id: u64,
     first_attach: Option<Instant>,
     attached_bit: bool,
     drain_until: Option<Instant>,
     signals: Signals,
+}
+
+fn valid_size(ws: &Winsize) -> bool {
+    ws.ws_row > 0 && ws.ws_col > 0
+}
+
+/// Do the two have the same rows and columns?
+fn same_cells(a: Option<Winsize>, b: Option<Winsize>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a.ws_row, a.ws_col) == (b.ws_row, b.ws_col),
+        _ => false,
+    }
 }
 
 fn unix_now() -> u64 {
@@ -518,10 +608,13 @@ pub fn run(session: Session, cfg: &Config) -> i32 {
         log,
         info,
         redraw: match cfg.redraw {
-            Redraw::Unspec if termios.is_some() => Redraw::Winch,
-            Redraw::Unspec => Redraw::None,
+            Redraw::Unspec => Redraw::Winch,
             other => other,
         },
+        nudge: None,
+        repaint: None,
+        owner: None,
+        next_id: 0,
         first_attach: cfg.wait_attach.then(|| Instant::now() + FIRST_ATTACH),
         attached_bit: false,
         drain_until: None,
@@ -568,6 +661,7 @@ impl Master<'_> {
     /// The poll loop. Returns true if a signal told us to stop.
     fn serve(&mut self) -> bool {
         loop {
+            self.watch_repaint();
             self.advance_clients();
             self.update_attached_bit();
             if self.finished() {
@@ -585,7 +679,9 @@ impl Master<'_> {
             if self.pty_open && !self.input.is_empty() {
                 pty_events |= PollFlags::OUT;
             }
-            let timeout = [self.first_attach, self.drain_until]
+            let nudge = self.nudge.as_ref().map(|n| n.watch.due());
+            let repaint = self.repaint.as_ref().map(Watch::due);
+            let timeout = [self.first_attach, self.drain_until, nudge, repaint]
                 .into_iter()
                 .flatten()
                 .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u32 + 1)
@@ -642,7 +738,59 @@ impl Master<'_> {
                     self.clients[i].flush();
                 }
             }
-            self.clients.retain(|c| !c.dead);
+            self.drop_dead();
+        }
+    }
+
+    /// Move a repaint along: put the real size back after a nudge, and see
+    /// whether the program has finished drawing.
+    fn watch_repaint(&mut self) {
+        let now = Instant::now();
+        if self.nudge.as_ref().is_some_and(|n| now >= n.watch.due()) {
+            if let Some(nudge) = self.nudge.take() {
+                let _ = sys::set_winsize(&self.pty, nudge.size);
+                self.repaint = Some(Watch::new(REPAINT_MIN, REPAINT_MAX));
+            }
+        }
+        if self.repaint.as_ref().is_some_and(|w| now >= w.due()) {
+            self.repaint = None;
+        }
+    }
+
+    fn drop_dead(&mut self) {
+        self.clients.retain(|c| !c.dead);
+        self.find_owner();
+    }
+
+    /// The size the window has, or will have once a nudge is over.
+    fn window(&self) -> Option<Winsize> {
+        match &self.nudge {
+            Some(nudge) => Some(nudge.size),
+            None => sys::winsize_of(&self.pty),
+        }
+    }
+
+    /// When the terminal whose size the window has goes, the window takes
+    /// the size of the one used most recently of those still attached.
+    fn find_owner(&mut self) {
+        if self
+            .clients
+            .iter()
+            .any(|c| Some(c.id) == self.owner && c.may_size())
+        {
+            return;
+        }
+        let next = self
+            .clients
+            .iter()
+            .filter(|c| c.may_size())
+            .max_by_key(|c| c.active)
+            .map(|c| (c.id, c.size));
+        self.owner = next.map(|(id, _)| id);
+        if let Some((_, Some(size))) = next {
+            if !same_cells(Some(size), self.window()) {
+                self.resize(size);
+            }
         }
     }
 
@@ -657,6 +805,8 @@ impl Master<'_> {
             self.handle_frames(i);
         }
         let ground = self.parser.is_ground();
+        let still = self.nudge.is_none() && self.repaint.is_none();
+        let total = self.ring.total();
         for client in &mut self.clients {
             // Prepare and write in turns until the client is caught up or
             // its socket is full; stopping earlier would leave it waiting
@@ -671,11 +821,18 @@ impl Master<'_> {
                     break;
                 }
             }
+            // The program has drawn, and the terminal has been sent it all.
+            if client.settle && still && matches!(client.phase, Phase::Live) && client.pos >= total
+            {
+                client.settle = false;
+                client.send(ServerMsg::Settled);
+                client.flush();
+            }
             if client.closing && !client.has_output() {
                 client.dead = true;
             }
         }
-        self.clients.retain(|c| !c.dead);
+        self.drop_dead();
     }
 
     fn update_attached_bit(&mut self) {
@@ -706,7 +863,8 @@ impl Master<'_> {
                 continue;
             }
             if stream.set_nonblocking(true).is_ok() {
-                self.clients.push(Client::new(stream));
+                self.next_id += 1;
+                self.clients.push(Client::new(self.next_id, stream));
             }
         }
     }
@@ -752,6 +910,13 @@ impl Master<'_> {
             self.ring.mark(self.ring.total());
         }
 
+        let now = Instant::now();
+        if let Some(nudge) = self.nudge.as_mut() {
+            nudge.watch.heard = Some(now);
+        }
+        if let Some(repaint) = self.repaint.as_mut() {
+            repaint.heard = Some(now);
+        }
         if let Some(log) = self.log.as_mut() {
             if !log.append(&self.session, data) {
                 // A full disk costs the log, not the session.
@@ -813,16 +978,43 @@ impl Master<'_> {
                         Cmd::Bad("expected a greeting".into())
                     }
                     Ok(ClientMsg::Input(data)) => {
-                        if !client.readonly {
-                            self.input.extend(data);
-                            client.paused = self.input.len() >= INPUT_MAX;
+                        if client.readonly {
+                            continue;
                         }
-                        continue;
+                        let scan = input::scan(data);
+                        // A terminal that is not setting the size reports a
+                        // size that is not the program's.
+                        let mut kept = 0;
+                        if self.owner != Some(client.id) {
+                            for cut in &scan.size_reports {
+                                self.input.extend(&data[kept..cut.start]);
+                                kept = cut.end;
+                            }
+                        }
+                        self.input.extend(&data[kept..]);
+                        client.paused = self.input.len() >= INPUT_MAX;
+                        if scan.active {
+                            client.active = Instant::now();
+                        }
+                        if !scan.active || self.owner == Some(client.id) {
+                            continue;
+                        }
+                        Cmd::Active
                     }
-                    Ok(ClientMsg::Hello { .. }) => Cmd::Hello,
+                    Ok(ClientMsg::Hello { version }) => Cmd::Hello(version),
                     Ok(ClientMsg::Attach(attach)) => Cmd::Attach(attach),
                     Ok(ClientMsg::Detach) => Cmd::Detach,
-                    Ok(ClientMsg::Resize { rows, cols }) => Cmd::Resize(rows, cols),
+                    Ok(ClientMsg::Resize {
+                        rows,
+                        cols,
+                        xpixel,
+                        ypixel,
+                    }) => Cmd::Resize(Winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: xpixel,
+                        ws_ypixel: ypixel,
+                    }),
                     Ok(ClientMsg::Redraw { method, rows, cols }) => Cmd::Redraw(method, rows, cols),
                     Ok(ClientMsg::Signal(sig)) => Cmd::Signal(sig),
                     Ok(ClientMsg::Clear) => Cmd::Clear,
@@ -838,9 +1030,10 @@ impl Master<'_> {
 
     fn apply(&mut self, i: usize, cmd: Cmd) {
         match cmd {
-            Cmd::Hello => {
+            Cmd::Hello(version) => {
                 let client = &mut self.clients[i];
                 client.greeted = true;
+                client.version = version;
                 client.send(ServerMsg::HelloAck {
                     version: VERSION,
                     session: self.info.id,
@@ -866,6 +1059,12 @@ impl Master<'_> {
                         }
                     }
                 };
+                let size = Winsize {
+                    ws_row: attach.rows,
+                    ws_col: attach.cols,
+                    ws_xpixel: attach.xpixel,
+                    ws_ypixel: attach.ypixel,
+                };
                 let client = &mut self.clients[i];
                 client.readonly = attach.readonly;
                 client.dump = attach.dump;
@@ -874,20 +1073,69 @@ impl Master<'_> {
                     end: total,
                     filter: Filter::queries(),
                 };
+                client.size = Some(size).filter(valid_size);
+                client.active = Instant::now();
+                client.settle = !attach.dump && client.version >= VERSION_SETTLED;
+                if attach.dump {
+                    return;
+                }
                 if !attach.readonly {
-                    self.first_attach = None;
-                    self.do_redraw(attach.redraw, attach.rows, attach.cols);
+                    self.owner = Some(client.id);
+                }
+                // The creator of a session, attaching while the program's
+                // output is held for it, sees all of it; nothing to repaint.
+                let fresh = !attach.readonly && self.first_attach.take().is_some();
+                if fresh {
+                    self.resize(size);
+                } else if attach.readonly {
+                    // A watcher does not get to set the size, or to type a
+                    // ^L, but the program can still be made to repaint.
+                    if self.redraw_method(attach.redraw) == Redraw::Winch {
+                        self.do_redraw(Redraw::Winch, None);
+                    }
+                } else {
+                    self.do_redraw(attach.redraw, Some(size));
                 }
             }
-            Cmd::Detach => self.clients[i].phase = Phase::Idle,
-            Cmd::Resize(rows, cols) => {
-                if !self.clients[i].readonly {
-                    self.resize(rows, cols);
+            Cmd::Detach => {
+                let client = &mut self.clients[i];
+                client.phase = Phase::Idle;
+                client.settle = false;
+                self.find_owner();
+            }
+            Cmd::Resize(size) => {
+                let client = &mut self.clients[i];
+                if client.readonly || !valid_size(&size) {
+                    return;
+                }
+                client.size = Some(size);
+                // Only the terminal in use sets the size; the others are
+                // remembered for when they are used.
+                if client.attached() && self.owner.is_none_or(|id| id == client.id) {
+                    self.owner = Some(client.id);
+                    self.resize(size);
+                }
+            }
+            Cmd::Active => {
+                let client = &self.clients[i];
+                if client.may_size() {
+                    self.owner = Some(client.id);
+                    let size = client.size;
+                    let window = self.window();
+                    if let Some(size) = size.filter(|s| !same_cells(Some(*s), window)) {
+                        self.resize(size);
+                    }
                 }
             }
             Cmd::Redraw(method, rows, cols) => {
                 if !self.clients[i].readonly {
-                    self.do_redraw(method, rows, cols);
+                    let size = Winsize {
+                        ws_row: rows,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    self.do_redraw(method, Some(size));
                 }
             }
             Cmd::Signal(number) => {
@@ -923,39 +1171,65 @@ impl Master<'_> {
         }
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
-        if rows > 0 && cols > 0 {
-            let size = Winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
+    /// Set the window size. A real change makes the kernel send SIGWINCH.
+    fn resize(&mut self, size: Winsize) {
+        if size.ws_row > 0 && size.ws_col > 0 {
+            // A size asked for outright replaces one still to be put back.
+            self.nudge = None;
             let _ = sys::set_winsize(&self.pty, size);
         }
     }
 
-    /// Get the program to repaint for a terminal that has just attached.
-    fn do_redraw(&mut self, method: Redraw, rows: u16, cols: u16) {
-        let method = if method == Redraw::Unspec {
+    fn redraw_method(&self, method: Redraw) -> Redraw {
+        if method == Redraw::Unspec {
             self.redraw
         } else {
             method
-        };
+        }
+    }
+
+    /// Get the program to repaint for a terminal that has just attached, at
+    /// `size`, or at the size it has when that is not given.
+    fn do_redraw(&mut self, method: Redraw, size: Option<Winsize>) {
+        let method = self.redraw_method(method);
         if method == Redraw::None {
             return;
         }
-        self.resize(rows, cols);
+        let settled = self.window().filter(valid_size);
+        let Some(size) = size.filter(valid_size).or(settled) else {
+            return;
+        };
+        let same = same_cells(settled, Some(size));
         match method {
-            Redraw::CtrlL if sys::pty_is_cbreak(&self.pty) => self.input.push_back(0x0c),
-            Redraw::Winch => {
-                let _ = sys::signal_foreground(
-                    self.pty.as_fd(),
-                    sys::pid_of(&self.child),
-                    rustix::process::Signal::WINCH,
-                );
+            Redraw::None => {}
+            Redraw::CtrlL => {
+                self.resize(size);
+                if sys::pty_is_cbreak(&self.pty) {
+                    self.input.push_back(0x0c);
+                }
+                self.repaint = Some(Watch::new(REPAINT_MIN, REPAINT_MAX));
             }
-            _ => {}
+            // A different size is a window change already.
+            Redraw::Winch | Redraw::Unspec if !same => {
+                self.resize(size);
+                self.repaint = Some(Watch::new(REPAINT_MIN, REPAINT_MAX));
+            }
+            Redraw::Winch | Redraw::Unspec => {
+                let narrower = Winsize {
+                    ws_col: if size.ws_col > 1 {
+                        size.ws_col - 1
+                    } else {
+                        size.ws_col + 1
+                    },
+                    ..size
+                };
+                let _ = sys::set_winsize(&self.pty, narrower);
+                self.repaint = None;
+                self.nudge = Some(Nudge {
+                    size,
+                    watch: Watch::new(NUDGE_MIN, NUDGE_MAX),
+                });
+            }
         }
     }
 
