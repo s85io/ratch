@@ -267,7 +267,10 @@ fn a_program_that_repaints_only_for_a_new_size_repaints_on_attach() {
 #[test]
 fn the_size_follows_the_terminal_in_use() {
     let home = Home::new("owner");
-    let script = "trap 'stty size' WINCH; stty size; while :; do sleep 0.05; done";
+    // Looks rather than waits for SIGWINCH: sh can lose one that comes while
+    // it is still running the trap for the one before.
+    let script = "last=; while :; do now=$(stty size); \
+        [ \"$now\" = \"$last\" ] || echo \"$now\"; last=$now; sleep 0.02; done";
     let mut desk = Term::spawn(&home, &["new", "s", "sh", "-c", script]);
     desk.expect("24 80");
 

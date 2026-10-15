@@ -10,7 +10,7 @@ makedepends=('cargo')
 provides=('ratch')
 conflicts=('ratch-git')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('0f0dc3fa7cc37f6b211be96f381237ddd1d986e7b1481479319b93a6154354b3')
 
 prepare() {
   cd "$pkgname-$pkgver"

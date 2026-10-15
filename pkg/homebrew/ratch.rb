@@ -2,7 +2,7 @@ class Ratch < Formula
   desc "Detachable terminal sessions without terminal emulation"
   homepage "https://github.com/s85io/ratch"
   url "https://github.com/s85io/ratch/archive/refs/tags/v0.2.0.tar.gz"
-  # sha256 "fill in from the release"
+  sha256 "0f0dc3fa7cc37f6b211be96f381237ddd1d986e7b1481479319b93a6154354b3"
   license "GPL-2.0-or-later"
   head "https://github.com/s85io/ratch.git", branch: "main"
 
